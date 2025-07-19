@@ -241,12 +241,12 @@ func (c *Client) buildGameContext(trk *tracker.Tracker) *GameContext {
 		LastStarted: time.Now(),
 	}
 
-	if context.GameName == "" && context.CoreName != "" {
+	if context.CoreName != "" {
 		if arcadeName := c.extractArcadeGameName(context.CoreName); arcadeName != "" {
 			context.GameName = arcadeName
 			context.SystemName = "Arcade"
 			context.GamePath = ""
-			c.logger.Info("claude: detected arcade core '%s', extracted game name '%s'", context.CoreName, arcadeName)
+			c.logger.Info("claude: detected arcade core '%s', using arcade name '%s'", context.CoreName, arcadeName)
 		}
 	}
 
