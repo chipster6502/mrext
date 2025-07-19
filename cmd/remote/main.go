@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/wizzomafizzo/mrext/cmd/remote/claude"
 	"github.com/wizzomafizzo/mrext/cmd/remote/control"
 	"github.com/wizzomafizzo/mrext/cmd/remote/games"
 	"github.com/wizzomafizzo/mrext/cmd/remote/menu"
@@ -266,6 +267,13 @@ func setupApi(sub *mux.Router, kbd input.Keyboard, trk *tracker.Tracker, logger 
 	sub.HandleFunc("/nfc/cancel", games.NfcCancel(logger)).Methods("POST")
 
 	sub.HandleFunc("/sysinfo", settings.HandleSystemInfo(logger, cfg, appVersion)).Methods("GET")
+
+	// Claude AI endpoints
+	sub.HandleFunc("/claude/status", claude.HandleStatus(logger, cfg)).Methods("GET")
+	sub.HandleFunc("/claude/chat", claude.HandleChat(logger, cfg, trk)).Methods("POST")
+	sub.HandleFunc("/claude/suggestions", claude.HandleSuggestions(logger, cfg, trk)).Methods("GET")
+	sub.HandleFunc("/claude/playlist", claude.HandlePlaylist(logger, cfg, trk)).Methods("POST")
+	sub.HandleFunc("/claude/config", claude.HandleUpdateConfig(logger, cfg)).Methods("PUT")
 }
 
 func appHandler(rw http.ResponseWriter, req *http.Request) {

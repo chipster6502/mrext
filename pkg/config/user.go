@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -62,6 +63,18 @@ type UserConfig struct {
 	Remote     RemoteConfig     `ini:"remote,omitempty"`
 	Nfc        NfcConfig        `ini:"nfc,omitempty"`
 	Systems    SystemsConfig    `ini:"systems,omitempty"`
+	Claude     ClaudeConfig     `ini:"claude,omitempty"`
+}
+
+// ClaudeConfig holds configuration for Claude AI integration
+type ClaudeConfig struct {
+	Enabled            bool   `ini:"enabled,omitempty"`               // Master switch for Claude functionality
+	APIKey             string `ini:"api_key,omitempty"`               // Anthropic API key
+	Model              string `ini:"model,omitempty"`                 // Claude model to use
+	MaxRequestsPerHour int    `ini:"max_requests_per_hour,omitempty"` // Rate limiting for cost control
+	AutoSuggestions    bool   `ini:"auto_suggestions,omitempty"`      // Enable automatic game suggestions
+	ChatHistory        int    `ini:"chat_history,omitempty"`          // Number of messages to keep in memory
+	TimeoutSeconds     int    `ini:"timeout_seconds,omitempty"`       // HTTP timeout for API requests
 }
 
 func LoadUserConfig(name string, defaultConfig *UserConfig) (*UserConfig, error) {
@@ -99,4 +112,36 @@ func LoadUserConfig(name string, defaultConfig *UserConfig) (*UserConfig, error)
 	}
 
 	return defaultConfig, nil
+}
+
+// GetDefaultClaudeConfig returns safe default configuration values
+func GetDefaultClaudeConfig() ClaudeConfig {
+	return ClaudeConfig{
+		Enabled:            false,                        // Disabled by default for security
+		APIKey:             "",                           // User must provide their own key
+		Model:              "claude-3-5-sonnet-20241022", // Balanced cost/performance model
+		MaxRequestsPerHour: 50,                           // Conservative limit
+		AutoSuggestions:    true,
+		ChatHistory:        10,
+		TimeoutSeconds:     30,
+	}
+}
+
+// ValidateClaudeConfig validates configuration values
+func (c *ClaudeConfig) ValidateClaudeConfig() error {
+	if c.Enabled {
+		if c.APIKey == "" {
+			return fmt.Errorf("claude enabled but no API key provided")
+		}
+		if c.MaxRequestsPerHour <= 0 {
+			return fmt.Errorf("max_requests_per_hour must be greater than 0")
+		}
+		if c.TimeoutSeconds <= 0 {
+			return fmt.Errorf("timeout_seconds must be greater than 0")
+		}
+		if c.ChatHistory < 0 {
+			return fmt.Errorf("chat_history cannot be negative")
+		}
+	}
+	return nil
 }
