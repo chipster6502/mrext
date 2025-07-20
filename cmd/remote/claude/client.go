@@ -178,6 +178,7 @@ Format as a simple list without numbers or bullets.`,
 	}, nil
 }
 
+// ✅ MODIFIED: GeneratePlaylist now handles installed games
 func (c *Client) GeneratePlaylist(ctx context.Context, request *PlaylistRequest) (*PlaylistResponse, error) {
 	if !c.config.Enabled {
 		return &PlaylistResponse{
@@ -205,7 +206,8 @@ func (c *Client) GeneratePlaylist(ctx context.Context, request *PlaylistRequest)
 		}, nil
 	}
 
-	games := c.parseGameRecommendations(response.Content, request.GameCount)
+	// ✅ MODIFIED: Pass installed games for validation
+	games := c.parseGameRecommendations(response.Content, request.GameCount, request.InstalledGames)
 
 	return &PlaylistResponse{
 		Games:     games,
@@ -543,7 +545,59 @@ func (c *Client) parseSuggestions(content string) []string {
 	}
 }
 
+// ✅ MODIFIED: buildPlaylistPrompt now uses installed games
 func (c *Client) buildPlaylistPrompt(request *PlaylistRequest) string {
+	if len(request.InstalledGames) == 0 {
+		// Fallback to generic recommendations if no games provided
+		return c.buildPlaylistPromptGeneric(request)
+	}
+
+	// Build list of user's actual games for Claude
+	var gamesList strings.Builder
+	gamesList.WriteString("AVAILABLE GAMES IN USER'S COLLECTION:\n\n")
+
+	// Group games by system for better organization
+	systemGames := make(map[string][]InstalledGame)
+	for _, game := range request.InstalledGames {
+		systemGames[game.System] = append(systemGames[game.System], game)
+	}
+
+	for system, games := range systemGames {
+		gamesList.WriteString(fmt.Sprintf("%s:\n", system))
+		for _, game := range games {
+			gamesList.WriteString(fmt.Sprintf("- %s\n", game.Name))
+		}
+		gamesList.WriteString("\n")
+	}
+
+	prompt := fmt.Sprintf(`You are generating a curated game playlist for a MiSTer FPGA user.
+
+THEME: %s
+REQUESTED COUNT: %d games
+
+%s
+
+IMPORTANT INSTRUCTIONS:
+- You MUST only recommend games from the user's collection listed above
+- Do NOT recommend games that are not in the list
+- Select games that best match the theme "%s"
+- Provide variety across different systems when possible
+- Focus on quality and theme relevance over quantity
+
+Format each recommendation exactly as:
+Game Name | System | Brief description | Why it fits the theme
+
+Only recommend games that appear exactly in the user's collection above.`,
+		request.Theme,
+		request.GameCount,
+		gamesList.String(),
+		request.Theme)
+
+	return prompt
+}
+
+// ✅ NEW: buildPlaylistPromptGeneric provides fallback for when no games are provided
+func (c *Client) buildPlaylistPromptGeneric(request *PlaylistRequest) string {
 	prompt := fmt.Sprintf("Generate exactly %d game recommendations for the theme: %s\n",
 		request.GameCount, request.Theme)
 
@@ -556,12 +610,20 @@ func (c *Client) buildPlaylistPrompt(request *PlaylistRequest) string {
 	}
 
 	prompt += "Format each game as: Game Name | System | Brief description | Why recommended"
-
 	return prompt
 }
 
-func (c *Client) parseGameRecommendations(content string, count int) []GameRecommendation {
+// ✅ MODIFIED: parseGameRecommendations now validates against installed games
+func (c *Client) parseGameRecommendations(content string, count int, installedGames []InstalledGame) []GameRecommendation {
 	recommendations := make([]GameRecommendation, 0, count)
+
+	// Create fast lookup map of installed games
+	installedMap := make(map[string]InstalledGame)
+	for _, game := range installedGames {
+		// Normalize name for search
+		key := strings.ToLower(strings.TrimSpace(game.Name))
+		installedMap[key] = game
+	}
 
 	// Split by double newlines first, then single newlines as backup
 	var lines []string
@@ -609,15 +671,52 @@ func (c *Client) parseGameRecommendations(content string, count int) []GameRecom
 			continue
 		}
 
+		// ✅ NEW: Validate game exists in user's collection (only if installed games provided)
+		var installedGame InstalledGame
+		var gameFound bool = true
+
+		if len(installedGames) > 0 {
+			normalizedName := strings.ToLower(strings.TrimSpace(name))
+			installedGame, gameFound = installedMap[normalizedName]
+
+			if !gameFound {
+				// Try fuzzy matching for slight variations
+				for installedName, installed := range installedMap {
+					if strings.Contains(installedName, normalizedName) ||
+						strings.Contains(normalizedName, installedName) {
+						installedGame = installed
+						gameFound = true
+						break
+					}
+				}
+				if !gameFound {
+					c.logger.Warn("claude playlist: game '%s' not found in collection, skipping", name)
+					continue
+				}
+			}
+		}
+
 		// Clean up "Recommended for" prefix if present
 		if strings.HasPrefix(strings.ToLower(reason), "recommended for ") {
 			reason = strings.TrimPrefix(reason, "Recommended for ")
 			reason = strings.TrimPrefix(reason, "recommended for ")
 		}
 
+		// Use real game info from user's collection if available
+		finalName := name
+		finalSystem := system
+		finalPath := ""
+
+		if len(installedGames) > 0 && gameFound {
+			finalName = installedGame.Name // ✅ Real filename from collection
+			finalSystem = installedGame.System
+			finalPath = installedGame.Path // ✅ Real path for launching
+		}
+
 		recommendations = append(recommendations, GameRecommendation{
-			Name:        name,
-			System:      system,
+			Name:        finalName,
+			System:      finalSystem,
+			Path:        finalPath,
 			Description: description,
 			Reason:      reason,
 		})
@@ -630,7 +729,12 @@ func (c *Client) parseGameRecommendations(content string, count int) []GameRecom
 
 	// If we got good recommendations, return them
 	if len(recommendations) > 0 {
-		c.logger.Info("claude: parsed %d game recommendations successfully", len(recommendations))
+		if len(installedGames) > 0 {
+			c.logger.Info("claude playlist: parsed %d valid recommendations from %d installed games",
+				len(recommendations), len(installedGames))
+		} else {
+			c.logger.Info("claude: parsed %d game recommendations successfully", len(recommendations))
+		}
 		return recommendations
 	}
 
@@ -640,18 +744,21 @@ func (c *Client) parseGameRecommendations(content string, count int) []GameRecom
 		{
 			Name:        "Pac-Man",
 			System:      "Arcade",
+			Path:        "",
 			Description: "Classic maze game with dots and ghosts",
 			Reason:      "Timeless gameplay and universal appeal",
 		},
 		{
 			Name:        "Space Invaders",
 			System:      "Arcade",
+			Path:        "",
 			Description: "Defend Earth from waves of alien invaders",
 			Reason:      "Pioneering shoot-em-up with escalating difficulty",
 		},
 		{
 			Name:        "Asteroids",
 			System:      "Arcade",
+			Path:        "",
 			Description: "Navigate space while destroying asteroids and UFOs",
 			Reason:      "Innovative vector graphics and physics-based gameplay",
 		},

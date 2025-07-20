@@ -4,6 +4,13 @@ import (
 	"time"
 )
 
+// ✅ ADD: InstalledGame represents a game file found in the user's collection
+type InstalledGame struct {
+	Name   string `json:"name"`
+	Path   string `json:"path"`
+	System string `json:"system"`
+}
+
 // ChatRequest represents a user message sent to Claude
 type ChatRequest struct {
 	Message        string `json:"message"`              // User's question or message
@@ -38,10 +45,11 @@ type SuggestionsResponse struct {
 
 // PlaylistRequest defines parameters for generating game playlists
 type PlaylistRequest struct {
-	Theme       string   `json:"theme"`                 // Playlist theme (e.g., "puzzle games")
-	GameCount   int      `json:"game_count"`            // Number of games to recommend
-	Systems     []string `json:"systems,omitempty"`     // Specific systems to include
-	Preferences string   `json:"preferences,omitempty"` // User preferences description
+	Theme          string          `json:"theme"`                     // Playlist theme (e.g., "puzzle games")
+	GameCount      int             `json:"game_count"`                // Number of games to recommend
+	Systems        []string        `json:"systems,omitempty"`         // Specific systems to include
+	Preferences    string          `json:"preferences,omitempty"`     // User preferences description
+	InstalledGames []InstalledGame `json:"installed_games,omitempty"` // User's actual game collection
 }
 
 // PlaylistResponse contains generated game recommendations
@@ -54,10 +62,13 @@ type PlaylistResponse struct {
 
 // GameRecommendation represents a single game suggestion
 type GameRecommendation struct {
-	Name        string `json:"name"`        // Game title
-	System      string `json:"system"`      // Target system/console
-	Description string `json:"description"` // Brief game description
-	Reason      string `json:"reason"`      // Why this game was recommended
+	Name        string    `json:"name"`         // Game title
+	System      string    `json:"system"`       // Target system/console
+	Path        string    `json:"path"`         // Actual file path for launching
+	Description string    `json:"description"`  // Brief game description
+	Reason      string    `json:"reason"`       // Why this game was recommended
+	GeneratedAt time.Time `json:"generated_at"` // When recommendation was made
+	Theme       string    `json:"theme"`        // Theme used for generation
 }
 
 // AnthropicRequest follows Anthropic API specification
@@ -67,41 +78,39 @@ type AnthropicRequest struct {
 	Messages  []Message `json:"messages"`   // Conversation history
 }
 
-// AnthropicResponse contains API response from Anthropic
+// AnthropicResponse contains API response from Claude
 type AnthropicResponse struct {
-	Content []ContentBlock `json:"content"` // Response content blocks
-	Usage   Usage          `json:"usage"`   // Token usage information
+	Content []struct {
+		Text string `json:"text"`
+		Type string `json:"type"`
+	} `json:"content"`
+	Error struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+	} `json:"error"`
+	Usage struct {
+		InputTokens  int `json:"input_tokens"`
+		OutputTokens int `json:"output_tokens"`
+	} `json:"usage"`
 }
 
-// Message represents a single conversation turn
+// Message represents a single message in conversation
 type Message struct {
 	Role    string `json:"role"`    // "user" or "assistant"
 	Content string `json:"content"` // Message text
 }
 
-// ContentBlock is part of Anthropic's response format
-type ContentBlock struct {
-	Type string `json:"type"` // Content type (usually "text")
-	Text string `json:"text"` // Actual response text
+// ChatSession maintains conversation state
+type ChatSession struct {
+	ID       string    `json:"id"`       // Session identifier
+	Messages []Message `json:"messages"` // Conversation history
+	Created  time.Time `json:"created"`  // When session was created
+	Updated  time.Time `json:"updated"`  // Last activity timestamp
 }
 
-// Usage tracks API token consumption
-type Usage struct {
-	InputTokens  int `json:"input_tokens"`  // Tokens in request
-	OutputTokens int `json:"output_tokens"` // Tokens in response
-}
-
-// RateLimiter controls API request frequency
+// RateLimiter prevents API abuse
 type RateLimiter struct {
 	requests    []time.Time   // Timestamps of recent requests
 	maxRequests int           // Maximum requests allowed
 	window      time.Duration // Time window for rate limiting
-}
-
-// ChatSession maintains conversation history per user session
-type ChatSession struct {
-	ID       string    `json:"id"`       // Unique session identifier
-	Messages []Message `json:"messages"` // Conversation history
-	Created  time.Time `json:"created"`  // Session creation time
-	Updated  time.Time `json:"updated"`  // Last activity time
 }
