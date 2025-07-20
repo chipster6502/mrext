@@ -27,7 +27,7 @@ type GameCache struct {
 
 var (
 	gameCache = &GameCache{}
-	cacheTTL  = 15 * time.Minute // Cache válido por 15 minutos
+	cacheTTL  = 15 * time.Minute // Cache valid for 15 minutes
 )
 
 // HandleChat processes interactive chat requests with Claude
