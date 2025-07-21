@@ -766,21 +766,40 @@ func (c *Client) similarStrings(a, b string) bool {
 
 // isLikelyArcadeCore determines if a core name likely represents an arcade game
 func (c *Client) isLikelyArcadeCore(coreName string) bool {
-	knownConsoles := []string{
-		"NES", "SNES", "Genesis", "SMS", "GG", "GB", "GBC", "GBA",
-		"N64", "PSX", "Saturn", "32X", "SCD", "PCE", "TGFX16",
-		"Atari2600", "Atari5200", "Atari7800", "ColecoVision",
-		"Intellivision", "Vectrex", "Odyssey2", "Channelf",
-		"A7800", "LYNX", "NGP", "WS", "C64", "Amiga", "Amstrad",
-		"ZX", "MSX", "AppleII", "Macintosh",
+	knownSystems := []string{
+		// CONSOLES
+		"AdventureVision", "Arcadia", "Astrocade", "Atari2600", "Atari5200", "Atari7800",
+		"AtariLynx", "CasioPV1000", "CasioPV2000", "ChannelF", "ColecoVision", "CreatiVision",
+		"FDS", "Gamate", "Gameboy", "Gameboy2P", "GameboyColor", "GameNWatch", "GBA", "GBA2P",
+		"Genesis", "Intellivision", "Jaguar", "MasterSystem", "MegaDuck", "NES", "NeoGeo",
+		"NeoGeoCD", "Nintendo64", "Odyssey2", "PCFX", "PokemonMini", "PSX", "Saturn", "Sega32X",
+		"SegaCD", "SG1000", "SMS", "SNES", "SuperGameboy", "SuperGrafx", "SuperVision",
+		"Tamagotchi", "TurboGrafx16", "TurboGrafx16CD", "VC4000", "Vectrex", "WonderSwan",
+		"WonderSwanColor",
+
+		// COMPUTERS
+		"AcornAtom", "AcornElectron", "AliceMC10", "Amiga", "AmigaCD32", "Amstrad", "AmstradPCW",
+		"Apogee", "AppleI", "AppleII", "Aquarius", "Atari800", "AtariST", "BBCMicro", "BK0011M",
+		"C64", "ChipTest", "CoCo2", "CoCo3", "EDSAC", "Galaksija", "Interact", "Jupiter",
+		"Laser", "Lynx48", "Macintosh", "MegaST", "MO5", "MSX", "MultiComp", "Orao", "Oric",
+		"PC88", "PDP1", "PET2001", "PMD85", "RX78", "SAMCoupe", "SharpMZ", "SordM5",
+		"Specialist", "TI994A", "TRS80", "TSConf", "UK101", "Vector06", "VIC20", "X68000",
+		"ZX81", "ZXSpectrum",
+
+		// OTHER SYSTEMS
+		"Arduboy", "Chip8", "FlappyBird", "Groovy",
+
+		// COMMON ALIASES
+		"TGFX16", "PCE", "GG", "GameGear", "N64", "A7800", "LYNX", "NGP", "WS",
 	}
 
-	for _, console := range knownConsoles {
-		if strings.EqualFold(coreName, console) {
+	for _, system := range knownSystems {
+		if strings.EqualFold(coreName, system) {
 			return false
 		}
 	}
 
+	// Typical arcade patterns
 	arcadePatterns := []string{
 		"194", "195", "196", "197", "198", "199",
 		"pac", "kong", "man", "fighter", "force", "strike",
@@ -793,7 +812,8 @@ func (c *Client) isLikelyArcadeCore(coreName string) bool {
 		}
 	}
 
-	return len(coreName) <= 10
+	// Only if the name is very short AND not in known systems
+	return len(coreName) <= 8
 }
 
 // cleanCoreName cleans up a core name for display
