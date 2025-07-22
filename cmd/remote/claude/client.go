@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"os"
 	"strings"
@@ -251,6 +252,14 @@ Provide helpful, relevant advice based on the game context.`,
 
 // buildGameContext extracts current game information from tracker
 func (c *Client) buildGameContext(trk *tracker.Tracker) *GameContext {
+	// ✅ EXTENSIVE DEBUG LOGGING
+	c.logger.Info("claude debug: === BUILDING GAME CONTEXT ===")
+	c.logger.Info("claude debug: ActiveCore = '%s'", trk.ActiveCore)
+	c.logger.Info("claude debug: ActiveGameName = '%s'", trk.ActiveGameName)
+	c.logger.Info("claude debug: ActiveSystemName = '%s'", trk.ActiveSystemName)
+	c.logger.Info("claude debug: ActiveGamePath = '%s'", trk.ActiveGamePath)
+	c.logger.Info("claude debug: ActiveGame = '%s'", trk.ActiveGame)
+
 	context := &GameContext{
 		CoreName:    trk.ActiveCore,
 		GameName:    trk.ActiveGameName,
@@ -259,15 +268,49 @@ func (c *Client) buildGameContext(trk *tracker.Tracker) *GameContext {
 		LastStarted: time.Now(),
 	}
 
-	// Special handling for arcade cores
+	// ✅ CRITICAL: Only override if we don't have good data from tracker
 	if context.CoreName != "" {
-		if arcadeName := c.extractArcadeGameName(context.CoreName); arcadeName != "" {
-			context.GameName = arcadeName
+		c.logger.Info("claude debug: Checking arcade detection for core '%s'", context.CoreName)
+
+		// If tracker already detected arcade properly, trust it!
+		if context.SystemName == "Arcade" && context.GameName != "" && context.GameName != context.CoreName {
+			c.logger.Info("claude debug: ✅ TRUSTING TRACKER: Arcade game '%s' already detected correctly", context.GameName)
+			// Don't override - tracker has the right info
+			return context
+		}
+
+		// If tracker says it's arcade but no game name, or game name == core name
+		if context.SystemName == "Arcade" && (context.GameName == "" || context.GameName == context.CoreName) {
+			c.logger.Info("claude debug: Tracker detected arcade but no specific game name, trying extraction...")
+			if arcadeName := c.extractArcadeGameName(context.CoreName); arcadeName != "" {
+				context.GameName = arcadeName
+				c.logger.Info("claude debug: ✅ EXTRACTION SUCCESS: '%s' -> '%s'", context.CoreName, arcadeName)
+			} else {
+				c.logger.Warn("claude debug: ❌ EXTRACTION FAILED for core '%s'", context.CoreName)
+				context.GameName = context.CoreName // fallback
+			}
 			context.SystemName = "Arcade"
 			context.GamePath = ""
-			c.logger.Info("claude: detected arcade core '%s', using arcade name '%s'", context.CoreName, arcadeName)
+			return context
+		}
+
+		// If tracker doesn't think it's arcade, but maybe it is
+		if context.SystemName != "Arcade" {
+			if arcadeName := c.extractArcadeGameName(context.CoreName); arcadeName != "" {
+				c.logger.Info("claude debug: ✅ OVERRIDE: Detected arcade core '%s' -> '%s' (tracker missed it)", context.CoreName, arcadeName)
+				context.GameName = arcadeName
+				context.SystemName = "Arcade"
+				context.GamePath = ""
+			} else {
+				c.logger.Info("claude debug: ✅ NON-ARCADE: Core '%s' is not arcade, keeping tracker data", context.CoreName)
+			}
 		}
 	}
+
+	c.logger.Info("claude debug: === FINAL CONTEXT ===")
+	c.logger.Info("claude debug: Final GameName = '%s'", context.GameName)
+	c.logger.Info("claude debug: Final SystemName = '%s'", context.SystemName)
+	c.logger.Info("claude debug: Final CoreName = '%s'", context.CoreName)
 
 	return context
 }
@@ -304,9 +347,30 @@ func (c *Client) buildPlaylistPrompt(request *PlaylistRequest) string {
 		}
 	}
 
+	// Seed random number generator for game shuffling
+	rand.Seed(time.Now().UnixNano())
+
 	for system, games := range systemGames {
 		gamesList.WriteString(fmt.Sprintf("%s (%d games available):\n", system, len(games)))
-		for _, game := range games {
+
+		// ✅ SIMPLE FIX: Reverse order + time-based rotation
+		orderedGames := make([]InstalledGame, len(games))
+		copy(orderedGames, games)
+
+		// Reverse the list to start with Z instead of A
+		for i, j := 0, len(orderedGames)-1; i < j; i, j = i+1, j-1 {
+			orderedGames[i], orderedGames[j] = orderedGames[j], orderedGames[i]
+		}
+
+		// Add time-based rotation to vary the starting point
+		offset := int(time.Now().Second()) % len(orderedGames)
+		rotatedGames := make([]InstalledGame, len(orderedGames))
+		for i, game := range orderedGames {
+			newIndex := (i + offset) % len(orderedGames)
+			rotatedGames[newIndex] = game
+		}
+
+		for _, game := range rotatedGames {
 			gamesList.WriteString(fmt.Sprintf("- %s\n", game.Name))
 		}
 		gamesList.WriteString("\n")
@@ -630,18 +694,26 @@ func (c *Client) parseSuggestions(content string) []string {
 
 // extractArcadeGameName attempts to match a core name to an arcade game
 func (c *Client) extractArcadeGameName(coreName string) string {
+	c.logger.Info("claude debug: === EXTRACTING ARCADE NAME ===")
+	c.logger.Info("claude debug: Looking for arcade name for core: '%s'", coreName)
+
 	arcadeDir := "/media/fat/_Arcade"
 
 	entries, err := os.ReadDir(arcadeDir)
 	if err != nil {
-		c.logger.Debug("claude: could not read _Arcade directory: %s", err)
+		c.logger.Error("claude debug: ❌ Could not read _Arcade directory: %s", err)
 		return ""
 	}
+
+	c.logger.Info("claude debug: Found %d entries in _Arcade directory", len(entries))
 
 	coreNameLower := strings.ToLower(coreName)
 	bestMatch := ""
 	bestScore := 0
+	totalMraFiles := 0
 
+	// Debug: Show first few .mra files
+	mraFiles := make([]string, 0)
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -650,6 +722,11 @@ func (c *Client) extractArcadeGameName(coreName string) string {
 		filename := entry.Name()
 		if !strings.HasSuffix(strings.ToLower(filename), ".mra") {
 			continue
+		}
+
+		totalMraFiles++
+		if len(mraFiles) < 10 { // Show first 10 for debugging
+			mraFiles = append(mraFiles, filename)
 		}
 
 		nameWithoutExt := strings.TrimSuffix(filename, ".mra")
@@ -666,18 +743,28 @@ func (c *Client) extractArcadeGameName(coreName string) string {
 		if score > bestScore {
 			bestScore = score
 			bestMatch = baseName
+			c.logger.Info("claude debug: New best match: '%s' -> '%s' (score: %d)", coreName, baseName, score)
 		}
 	}
 
+	c.logger.Info("claude debug: Total MRA files: %d", totalMraFiles)
+	c.logger.Info("claude debug: Sample MRA files: %v", mraFiles)
+	c.logger.Info("claude debug: Best match: '%s' with score %d", bestMatch, bestScore)
+
 	if bestScore >= 70 {
-		c.logger.Info("claude: matched core '%s' to arcade game '%s' (score: %d)", coreName, bestMatch, bestScore)
+		c.logger.Info("claude debug: ✅ MATCH ACCEPTED: core '%s' -> arcade game '%s' (score: %d)", coreName, bestMatch, bestScore)
 		return bestMatch
 	}
 
+	c.logger.Info("claude debug: ❌ MATCH REJECTED: score %d < 70, trying fallback", bestScore)
+
 	if c.isLikelyArcadeCore(coreName) {
-		return c.cleanCoreName(coreName)
+		cleaned := c.cleanCoreName(coreName)
+		c.logger.Info("claude debug: ✅ FALLBACK: Using cleaned core name '%s' -> '%s'", coreName, cleaned)
+		return cleaned
 	}
 
+	c.logger.Info("claude debug: ❌ NOT ARCADE: Core '%s' doesn't appear to be arcade", coreName)
 	return ""
 }
 
@@ -896,4 +983,203 @@ func (c *Client) trimSessionHistory(session *ChatSession) {
 		start := len(session.Messages) - c.config.ChatHistory*2
 		session.Messages = session.Messages[start:]
 	}
+}
+
+// =========================================
+// ADD THESE NEW FUNCTIONS TO client.go
+// Do NOT replace existing functions
+// =========================================
+
+// GeneratePlaylistFromActiveGame creates a playlist based on the currently active game
+func (c *Client) GeneratePlaylistFromActiveGame(ctx context.Context, request *PlaylistRequest, trk *tracker.Tracker) (*PlaylistResponse, error) {
+	if !c.config.Enabled {
+		return &PlaylistResponse{
+			Error:     "Claude is disabled",
+			Timestamp: time.Now(),
+		}, nil
+	}
+
+	// Get current game context
+	gameContext := c.buildGameContext(trk)
+	if gameContext.GameName == "" {
+		return &PlaylistResponse{
+			Error:     "No game currently active to base playlist on",
+			Theme:     request.Theme,
+			Timestamp: time.Now(),
+		}, nil
+	}
+
+	// Build specialized prompt for active game
+	prompt := c.buildActiveGamePlaylistPrompt(request, gameContext)
+
+	response, err := c.SendMessage(ctx, prompt, gameContext, "playlist")
+	if err != nil {
+		return &PlaylistResponse{
+			Error:     "Failed to generate playlist based on active game",
+			Theme:     request.Theme,
+			Timestamp: time.Now(),
+		}, nil
+	}
+
+	if response.Error != "" {
+		return &PlaylistResponse{
+			Error:     response.Error,
+			Theme:     request.Theme,
+			Timestamp: time.Now(),
+		}, nil
+	}
+
+	// Parse and validate game recommendations
+	games := c.parseGameRecommendations(response.Content, request.GameCount, request.InstalledGames)
+
+	// Set theme to reflect active game context
+	finalTheme := request.Theme
+	if finalTheme == "" {
+		finalTheme = fmt.Sprintf("Games similar to %s", gameContext.GameName)
+	}
+
+	return &PlaylistResponse{
+		Games:     games,
+		Theme:     finalTheme,
+		Timestamp: time.Now(),
+	}, nil
+}
+
+// buildActiveGamePlaylistPrompt creates a specialized prompt for active game-based playlists
+func (c *Client) buildActiveGamePlaylistPrompt(request *PlaylistRequest, gameContext *GameContext) string {
+	if len(request.InstalledGames) == 0 {
+		// Fallback to generic recommendations if no games provided
+		return c.buildActiveGamePlaylistPromptGeneric(request, gameContext)
+	}
+
+	// Build list of user's actual games for Claude
+	var gamesList strings.Builder
+	gamesList.WriteString("AVAILABLE GAMES IN USER'S COLLECTION:\n\n")
+
+	// Group games by system for better organization
+	systemGames := make(map[string][]InstalledGame)
+	for _, game := range request.InstalledGames {
+		systemGames[game.System] = append(systemGames[game.System], game)
+	}
+
+	for system, games := range systemGames {
+		gamesList.WriteString(fmt.Sprintf("%s (%d games available):\n", system, len(games)))
+		for _, game := range games {
+			gamesList.WriteString(fmt.Sprintf("- %s\n", game.Name))
+		}
+		gamesList.WriteString("\n")
+	}
+
+	// Determine the theme context
+	themeContext := ""
+	if request.Theme != "" && !isActiveGameThemeKeyword(request.Theme) {
+		themeContext = fmt.Sprintf(" with focus on: %s", request.Theme)
+	}
+
+	prompt := fmt.Sprintf(`You are generating a curated game playlist for a MiSTer FPGA user based on their currently active game.
+
+CURRENTLY PLAYING: %s (%s system)
+REQUESTED COUNT: %d games
+SELECTED SYSTEMS: %v
+
+%s
+
+CORE INSTRUCTION:
+Generate a playlist of games similar to "%s" that the user is currently playing%s.
+
+SIMILARITY CRITERIA:
+- Genre and gameplay style
+- Art style and visual presentation  
+- Difficulty level and game mechanics
+- Time period or setting (if relevant)
+- Overall "feel" and atmosphere
+
+CRITICAL REQUIREMENTS:
+- You MUST only recommend games from the user's collection listed above
+- Do NOT recommend games that are not in the list
+- Do NOT include the currently active game ("%s") in the recommendations
+- Focus on games that share DNA with the active game
+- If multiple systems are selected, provide variety across systems when possible
+- Prioritize quality matches over quantity
+
+FORMAT REQUIREMENTS:
+Format each recommendation exactly as:
+Game Name | System | Brief description | Why it's similar to %s
+
+Only recommend games that appear exactly in the user's collection above.`,
+		gameContext.GameName,
+		gameContext.SystemName,
+		request.GameCount,
+		request.Systems,
+		gamesList.String(),
+		gameContext.GameName,
+		themeContext,
+		gameContext.GameName,
+		gameContext.GameName)
+
+	return prompt
+}
+
+// buildActiveGamePlaylistPromptGeneric provides fallback for when no games are provided
+func (c *Client) buildActiveGamePlaylistPromptGeneric(request *PlaylistRequest, gameContext *GameContext) string {
+	themeContext := ""
+	if request.Theme != "" && !isActiveGameThemeKeyword(request.Theme) {
+		themeContext = fmt.Sprintf(" with focus on: %s", request.Theme)
+	}
+
+	prompt := fmt.Sprintf(`Generate exactly %d game recommendations similar to "%s" (%s system)%s.
+
+Look for games that share:
+- Similar gameplay mechanics
+- Comparable visual style
+- Similar difficulty or complexity
+- Related themes or settings
+
+`,
+		request.GameCount, gameContext.GameName, gameContext.SystemName, themeContext)
+
+	if len(request.Systems) > 0 {
+		prompt += fmt.Sprintf("Focus on these systems: %v\n", request.Systems)
+	}
+
+	if request.Preferences != "" {
+		prompt += fmt.Sprintf("User preferences: %s\n", request.Preferences)
+	}
+
+	prompt += "Format each game as: Game Name | System | Brief description | Why it's similar"
+	return prompt
+}
+
+// isActiveGameThemeKeyword checks if the theme indicates active game-based playlist
+func isActiveGameThemeKeyword(theme string) bool {
+	theme = strings.ToLower(strings.TrimSpace(theme))
+	keywords := []string{
+		"active game",
+		"current game",
+		"similar to active",
+		"similar to current",
+		"based on active",
+		"based on current",
+		"like current game",
+		"like active game",
+		"playlist based in active game", // User's specific example
+		"playlist based on active game",
+	}
+
+	for _, keyword := range keywords {
+		if strings.Contains(theme, keyword) {
+			return true
+		}
+	}
+	return false
+}
+
+// GetActiveGameSuggestion returns a dynamic suggestion based on the current active game
+func (c *Client) GetActiveGameSuggestion(trk *tracker.Tracker) string {
+	gameContext := c.buildGameContext(trk)
+	if gameContext.GameName == "" {
+		return "Similar games to active game" // fallback when no game is active
+	}
+
+	return fmt.Sprintf("Games similar to %s", gameContext.GameName)
 }

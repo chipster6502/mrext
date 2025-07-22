@@ -231,8 +231,15 @@ func HandlePlaylist(logger *service.Logger, cfg *config.UserConfig, trk *tracker
 		ctx, cancel := context.WithTimeout(r.Context(), remainingTime)
 		defer cancel()
 
-		// Generate playlist
-		response, err := client.GeneratePlaylist(ctx, &request)
+		// Check if this is an active game-based playlist request
+		var response *PlaylistResponse
+		if isActiveGameThemeKeyword(request.Theme) {
+			// Use active game-based playlist generation
+			response, err = client.GeneratePlaylistFromActiveGame(ctx, &request, trk)
+		} else {
+			// Use standard playlist generation
+			response, err = client.GeneratePlaylist(ctx, &request)
+		}
 		if err != nil {
 			logger.Error("claude playlist: %s", err)
 			http.Error(w, "Failed to generate playlist", http.StatusInternalServerError)
@@ -389,39 +396,68 @@ func buildGameCacheFast(cfg *config.UserConfig, logger *service.Logger, systemId
 	return installedGames, nil
 }
 
-// ✅ SMART: Pre-filter games by theme relevance
+// ✅ SMART: Pre-filter games by theme relevance (FIXED - no alphabetical bias)
 func smartFilterGames(games []InstalledGame, theme string, maxGames int) []InstalledGame {
 	if len(games) <= maxGames {
-		return games
+		// ✅ Even for small collections, randomize to prevent bias
+		randomized := make([]InstalledGame, len(games))
+		copy(randomized, games)
+
+		// Simple time-based shuffle for small collections
+		for i := len(randomized) - 1; i > 0; i-- {
+			j := int(time.Now().UnixNano()) % (i + 1)
+			randomized[i], randomized[j] = randomized[j], randomized[i]
+		}
+		return randomized
 	}
 
 	themeKeywords := extractThemeKeywords(theme)
-	var scored []struct {
-		game  InstalledGame
-		score int
-	}
+
+	// ✅ Group games by score to handle ties properly
+	scoreGroups := make(map[int][]InstalledGame)
+	maxScore := 0
 
 	for _, game := range games {
 		score := calculateGameThemeScore(game, themeKeywords)
-		scored = append(scored, struct {
-			game  InstalledGame
-			score int
-		}{game, score})
+		if score > maxScore {
+			maxScore = score
+		}
+		scoreGroups[score] = append(scoreGroups[score], game)
 	}
 
-	// Sort by score (descending)
-	for i := 0; i < len(scored)-1; i++ {
-		for j := 0; j < len(scored)-i-1; j++ {
-			if scored[j].score < scored[j+1].score {
-				scored[j], scored[j+1] = scored[j+1], scored[j]
+	// ✅ Randomize within each score group to eliminate alphabetical bias
+	for score, gameList := range scoreGroups {
+		shuffled := make([]InstalledGame, len(gameList))
+		copy(shuffled, gameList)
+
+		// Time-based shuffle for each score group
+		baseTime := time.Now().UnixNano()
+		for i := len(shuffled) - 1; i > 0; i-- {
+			// Use score + index + time to ensure different randomization per group
+			seed := baseTime + int64(score*1000) + int64(i*100)
+			j := int(seed) % (i + 1)
+			if j < 0 {
+				j = -j
+			}
+			shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+		}
+
+		scoreGroups[score] = shuffled
+	}
+
+	// ✅ Collect results by score (highest first), but randomized within each score
+	result := make([]InstalledGame, 0, maxGames)
+
+	// Iterate through scores from highest to lowest
+	for score := maxScore; score >= 0 && len(result) < maxGames; score-- {
+		if gameList, exists := scoreGroups[score]; exists {
+			for _, game := range gameList {
+				if len(result) >= maxGames {
+					break
+				}
+				result = append(result, game)
 			}
 		}
-	}
-
-	// Return top scored games
-	result := make([]InstalledGame, 0, maxGames)
-	for i := 0; i < len(scored) && i < maxGames; i++ {
-		result = append(result, scored[i].game)
 	}
 
 	return result
@@ -821,4 +857,100 @@ func parseIntParam(r *http.Request, param string, defaultValue int) int {
 	}
 
 	return parsed
+}
+
+// Helper function to check if theme indicates active game-based playlist
+func isActiveGameThemeKeyword(theme string) bool {
+	theme = strings.ToLower(strings.TrimSpace(theme))
+	keywords := []string{
+		"active game",
+		"current game",
+		"similar to active",
+		"similar to current",
+		"based on active",
+		"based on current",
+		"like current game",
+		"like active game",
+		"playlist based in active game", // User's specific example
+		"playlist based on active game",
+	}
+
+	for _, keyword := range keywords {
+		if strings.Contains(theme, keyword) {
+			return true
+		}
+	}
+	return false
+}
+
+// HandleActiveGameSuggestion returns a dynamic suggestion based on current active game
+func HandleActiveGameSuggestion(logger *service.Logger, cfg *config.UserConfig, trk *tracker.Tracker) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Verify Claude is enabled
+		if !cfg.Claude.Enabled {
+			http.Error(w, "Claude is not enabled", http.StatusServiceUnavailable)
+			return
+		}
+
+		// Create Claude client
+		client := NewClient(&cfg.Claude, logger)
+
+		// Get dynamic suggestion based on active game
+		suggestion := client.GetActiveGameSuggestion(trk)
+
+		response := map[string]interface{}{
+			"suggestion": suggestion,
+			"timestamp":  time.Now(),
+		}
+
+		// Set response headers
+		w.Header().Set("Content-Type", "application/json")
+
+		// Encode and send response
+		err := json.NewEncoder(w).Encode(response)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			logger.Error("claude active game suggestion: failed to encode response: %s", err)
+			return
+		}
+
+		logger.Info("claude active game suggestion: returned '%s'", suggestion)
+	}
+}
+
+// HandleDebugActiveGame provides debugging info for active game detection
+func HandleDebugActiveGame(logger *service.Logger, cfg *config.UserConfig, trk *tracker.Tracker) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Create Claude client for debugging
+		client := NewClient(&cfg.Claude, logger)
+
+		// Build game context with full debugging
+		gameContext := client.buildGameContext(trk)
+
+		// Prepare debug response
+		debugInfo := map[string]interface{}{
+			"tracker_data": map[string]interface{}{
+				"active_core":        trk.ActiveCore,
+				"active_game":        trk.ActiveGame,
+				"active_game_name":   trk.ActiveGameName,
+				"active_system_name": trk.ActiveSystemName,
+				"active_game_path":   trk.ActiveGamePath,
+			},
+			"context_data": map[string]interface{}{
+				"core_name":   gameContext.CoreName,
+				"game_name":   gameContext.GameName,
+				"system_name": gameContext.SystemName,
+				"game_path":   gameContext.GamePath,
+			},
+			"detection_results": map[string]interface{}{
+				"is_arcade":       gameContext.SystemName == "Arcade",
+				"extraction_test": client.extractArcadeGameName(trk.ActiveCore),
+			},
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(debugInfo)
+
+		logger.Info("claude debug: Debug info sent to client")
+	}
 }

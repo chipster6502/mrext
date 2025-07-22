@@ -114,3 +114,9 @@ type RateLimiter struct {
 	maxRequests int           // Maximum requests allowed
 	window      time.Duration // Time window for rate limiting
 }
+
+// ActiveGameSuggestionResponse for dynamic active game suggestions
+type ActiveGameSuggestionResponse struct {
+	Suggestion string    `json:"suggestion"` // Dynamic suggestion text based on active game
+	Timestamp  time.Time `json:"timestamp"`  // When suggestion was generated
+}
