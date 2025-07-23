@@ -68,7 +68,7 @@ func HandleChat(logger *service.Logger, cfg *config.UserConfig, trk *tracker.Tra
 		// Get game context if requested
 		var gameContext *GameContext
 		if request.IncludeContext && trk != nil {
-			gameContext = client.BuildGameContext(trk)
+			gameContext = client.buildGameContext(trk)
 		}
 
 		// Create context with timeout
@@ -1068,7 +1068,7 @@ func HandleDebugActiveGame(logger *service.Logger, cfg *config.UserConfig, trk *
 		client := NewClient(&cfg.Claude, logger)
 
 		// Build game context with full debugging
-		gameContext := client.BuildGameContext(trk)
+		gameContext := client.buildGameContext(trk)
 
 		// Prepare debug response
 		debugInfo := map[string]interface{}{

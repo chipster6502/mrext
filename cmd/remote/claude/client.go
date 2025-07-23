@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -160,7 +159,7 @@ func (c *Client) GenerateSuggestions(ctx context.Context, trk *tracker.Tracker) 
 		}, nil
 	}
 
-	gameContext := c.BuildGameContext(trk)
+	gameContext := c.buildGameContext(trk)
 	if gameContext.GameName == "" {
 		return &SuggestionsResponse{
 			Suggestions: []string{"No game currently running"},
@@ -257,7 +256,7 @@ Provide helpful, relevant advice based on the game context.`,
 }
 
 // buildGameContext extracts current game information from tracker
-func (c *Client) BuildGameContext(trk *tracker.Tracker) *GameContext {
+func (c *Client) buildGameContext(trk *tracker.Tracker) *GameContext {
 	// ✅ EXTENSIVE DEBUG LOGGING
 	c.logger.Info("claude debug: === BUILDING GAME CONTEXT ===")
 	c.logger.Info("claude debug: ActiveCore = '%s'", trk.ActiveCore)
@@ -330,7 +329,7 @@ func (c *Client) BuildGameContext(trk *tracker.Tracker) *GameContext {
 	return context
 }
 
-// Enhanced SAM detection with obsolete file detection
+// Enhanced SAM detection with detailed logging
 func (c *Client) checkSAMStatus() *SAMGameInfo {
 	samFile := "/tmp/SAM_Game.txt"
 
@@ -349,12 +348,6 @@ func (c *Client) checkSAMStatus() *SAMGameInfo {
 		return nil
 	}
 
-	// ✅ NEW: Check if SAM file is obsolete
-	if c.isSAMFileObsolete(samFile) {
-		c.logger.Info("claude debug: SAM file appears to be obsolete - ignoring")
-		return nil
-	}
-
 	samInfo := c.parseSAMGameInfo(samGameText)
 	if samInfo != nil {
 		c.logger.Info("claude debug: SAM parsed successfully - Game: '%s', Core: '%s', System: '%s'",
@@ -364,63 +357,6 @@ func (c *Client) checkSAMStatus() *SAMGameInfo {
 	}
 
 	return samInfo
-}
-
-// ✅ NEW: Check if SAM file is obsolete (multiple verification methods)
-func (c *Client) isSAMFileObsolete(samFile string) bool {
-	// Method 1: Check file age
-	if c.isSAMFileOld(samFile) {
-		c.logger.Info("claude debug: SAM file is too old (>5 minutes)")
-		return true
-	}
-
-	// Method 2: Check if SAM process is running
-	if !c.isSAMProcessRunning() {
-		c.logger.Info("claude debug: SAM process not detected")
-		return true
-	}
-
-	c.logger.Info("claude debug: SAM file appears to be current and valid")
-	return false
-}
-
-// ✅ NEW: Check if SAM file is older than 5 minutes
-func (c *Client) isSAMFileOld(samFile string) bool {
-	stat, err := os.Stat(samFile)
-	if err != nil {
-		c.logger.Info("claude debug: Cannot stat SAM file: %s", err)
-		return true // Treat errors as obsolete
-	}
-
-	age := time.Since(stat.ModTime())
-	maxAge := 5 * time.Minute
-
-	c.logger.Info("claude debug: SAM file age: %v (max allowed: %v)", age, maxAge)
-	return age > maxAge
-}
-
-// ✅ NEW: Check if SAM process is actually running
-func (c *Client) isSAMProcessRunning() bool {
-	// Check for common SAM process patterns
-	processes := []string{"MiSTer_SAM", "sam", "attract"}
-
-	for _, proc := range processes {
-		cmd := exec.Command("pgrep", "-f", proc)
-		if err := cmd.Run(); err == nil {
-			c.logger.Info("claude debug: Found SAM-related process: %s", proc)
-			return true
-		}
-	}
-
-	// Alternative: Check for SAM script execution
-	cmd := exec.Command("pgrep", "-f", "MiSTer_SAM_on.sh")
-	if err := cmd.Run(); err == nil {
-		c.logger.Info("claude debug: Found SAM script process")
-		return true
-	}
-
-	c.logger.Info("claude debug: No SAM processes detected")
-	return false
 }
 
 // Enhanced parsing with detailed logging
@@ -1133,7 +1069,7 @@ func (c *Client) GeneratePlaylistFromActiveGame(ctx context.Context, request *Pl
 	}
 
 	// Get current game context
-	gameContext := c.BuildGameContext(trk)
+	gameContext := c.buildGameContext(trk)
 	if gameContext.GameName == "" {
 		return &PlaylistResponse{
 			Error:     "No game currently active to base playlist on",
@@ -1319,7 +1255,7 @@ RANDOMIZATION REQUIREMENT:
 
 // GetActiveGameSuggestion returns a dynamic suggestion based on the current active game
 func (c *Client) GetActiveGameSuggestion(trk *tracker.Tracker) string {
-	gameContext := c.BuildGameContext(trk)
+	gameContext := c.buildGameContext(trk)
 	if gameContext.GameName == "" {
 		return "Similar games to active game" // fallback when no game is active
 	}
