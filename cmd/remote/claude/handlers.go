@@ -134,9 +134,8 @@ func HandleSuggestions(logger *service.Logger, cfg *config.UserConfig, trk *trac
 		ctx, cancel := context.WithTimeout(r.Context(), time.Duration(cfg.Claude.TimeoutSeconds)*time.Second)
 		defer cancel()
 
-		// Build game context first, then generate suggestions
-		gameContext := client.BuildGameContext(trk)
-		response, err := client.GenerateSuggestions(ctx, gameContext)
+		// Generate suggestions
+		response, err := client.GenerateSuggestions(ctx, trk)
 		if err != nil {
 			logger.Error("claude suggestions: %s", err)
 			http.Error(w, "Failed to generate suggestions", http.StatusInternalServerError)
@@ -1040,13 +1039,7 @@ func HandleActiveGameSuggestion(logger *service.Logger, cfg *config.UserConfig, 
 		client := NewClient(&cfg.Claude, logger)
 
 		// Get dynamic suggestion based on active game
-		gameContext := client.BuildGameContext(trk)
-		var suggestion string
-		if gameContext.GameName != "" {
-			suggestion = "Try exploring different strategies for " + gameContext.GameName
-		} else {
-			suggestion = "Try exploring different games and systems"
-		}
+		suggestion := client.GetActiveGameSuggestion(trk)
 
 		response := map[string]interface{}{
 			"suggestion": suggestion,
