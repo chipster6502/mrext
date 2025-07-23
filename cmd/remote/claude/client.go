@@ -30,6 +30,7 @@ type SAMGameInfo struct {
 	CoreName   string
 	SystemName string
 }
+
 type Client struct {
 	config      *config.ClaudeConfig
 	logger      *service.Logger
@@ -99,86 +100,123 @@ func (c *Client) SendMessage(ctx context.Context, message string, gameContext *G
 		}, nil
 	}
 
-	prompt := c.buildPrompt(message, gameContext)
+	if c.config.APIKey == "" {
+		return &ChatResponse{
+			Error:     "Claude API key not configured",
+			Timestamp: time.Now(),
+		}, nil
+	}
+
+	// Get or create session
 	session := c.getOrCreateSession(sessionID)
 
+	// Build context-aware prompt
+	prompt := c.buildContextualPrompt(message, gameContext)
+
 	// Add user message to session
-	session.Messages = append(session.Messages, Message{
+	userMsg := Message{
 		Role:    "user",
 		Content: prompt,
-	})
+	}
+	session.Messages = append(session.Messages, userMsg)
 
 	// Trim session history if too long
 	c.trimSessionHistory(session)
 
 	// Prepare API request
-	apiRequest := AnthropicRequest{
+	reqBody := AnthropicRequest{
 		Model:     c.config.Model,
 		MaxTokens: maxTokens,
 		Messages:  session.Messages,
 	}
 
-	// Call Anthropic API
-	apiResponse, err := c.callAnthropicAPI(ctx, &apiRequest)
+	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
-		c.logger.Error("claude api call failed: %s", err)
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	// Create HTTP request
+	req, err := http.NewRequestWithContext(ctx, "POST", anthropicAPIURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", c.config.APIKey)
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	req.Header.Set("User-Agent", userAgent)
+
+	// Send request
+	c.logger.Info("claude: sending request to API")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("API request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Parse response
+	var apiResp AnthropicResponse
+	err = json.NewDecoder(resp.Body).Decode(&apiResp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	// Check for API errors
+	if apiResp.Error.Message != "" {
+		c.logger.Error("claude API error: %s", apiResp.Error.Message)
 		return &ChatResponse{
-			Error:     "Failed to communicate with Claude. Please try again.",
+			Error:     fmt.Sprintf("API Error: %s", apiResp.Error.Message),
 			Timestamp: time.Now(),
-			Context:   gameContext,
 		}, nil
 	}
 
-	// Extract response text
-	responseText := ""
-	if len(apiResponse.Content) > 0 {
-		responseText = apiResponse.Content[0].Text
+	// Extract content
+	if len(apiResp.Content) == 0 {
+		return &ChatResponse{
+			Error:     "No content in API response",
+			Timestamp: time.Now(),
+		}, nil
+	}
+
+	content := apiResp.Content[0].Text
+	if content == "" {
+		return &ChatResponse{
+			Error:     "Empty response from Claude",
+			Timestamp: time.Now(),
+		}, nil
 	}
 
 	// Add assistant response to session
-	session.Messages = append(session.Messages, Message{
+	assistantMsg := Message{
 		Role:    "assistant",
-		Content: responseText,
-	})
-	session.Updated = time.Now()
+		Content: content,
+	}
+	session.Messages = append(session.Messages, assistantMsg)
 
-	c.logger.Info("claude response generated successfully (tokens: %d/%d)",
-		apiResponse.Usage.InputTokens, apiResponse.Usage.OutputTokens)
+	c.logger.Info("claude: response received successfully")
 
 	return &ChatResponse{
-		Content:   responseText,
+		Content:   content,
 		Timestamp: time.Now(),
 		Context:   gameContext,
 	}, nil
 }
 
-// GenerateSuggestions creates game tips and suggestions
-func (c *Client) GenerateSuggestions(ctx context.Context, trk *tracker.Tracker) (*SuggestionsResponse, error) {
-	if !c.config.Enabled || !c.config.AutoSuggestions {
+// GenerateSuggestions creates contextual suggestions for the current game
+func (c *Client) GenerateSuggestions(ctx context.Context, gameContext *GameContext) (*SuggestionsResponse, error) {
+	if !c.config.Enabled {
 		return &SuggestionsResponse{
-			Suggestions: []string{},
-			Timestamp:   time.Now(),
+			Error:     "Claude is disabled",
+			Timestamp: time.Now(),
 		}, nil
 	}
 
-	gameContext := c.BuildGameContext(trk)
-	if gameContext.GameName == "" {
-		return &SuggestionsResponse{
-			Suggestions: []string{"No game currently running"},
-			Timestamp:   time.Now(),
-		}, nil
-	}
-
-	prompt := fmt.Sprintf(`Generate 3 brief, helpful suggestions for someone playing "%s" on the %s system. 
-Focus on tips, strategies, or interesting facts. Keep each suggestion under 50 words.
-Format as a simple list without numbers or bullets.`,
-		gameContext.GameName, gameContext.SystemName)
+	prompt := c.buildSuggestionsPrompt(gameContext)
 
 	response, err := c.SendMessage(ctx, prompt, gameContext, "suggestions")
 	if err != nil {
 		return &SuggestionsResponse{
 			Error:     "Failed to generate suggestions",
-			Context:   gameContext,
 			Timestamp: time.Now(),
 		}, nil
 	}
@@ -186,7 +224,6 @@ Format as a simple list without numbers or bullets.`,
 	if response.Error != "" {
 		return &SuggestionsResponse{
 			Error:     response.Error,
-			Context:   gameContext,
 			Timestamp: time.Now(),
 		}, nil
 	}
@@ -200,61 +237,164 @@ Format as a simple list without numbers or bullets.`,
 	}, nil
 }
 
-// GeneratePlaylist creates themed game playlists
-func (c *Client) GeneratePlaylist(ctx context.Context, request *PlaylistRequest) (*PlaylistResponse, error) {
-	if !c.config.Enabled {
-		return &PlaylistResponse{
-			Error:     "Claude is disabled",
-			Timestamp: time.Now(),
-		}, nil
+// buildContextualPrompt creates a context-aware prompt for Claude
+func (c *Client) buildContextualPrompt(message string, gameContext *GameContext) string {
+	if gameContext == nil || gameContext.GameName == "" {
+		return message
 	}
 
-	prompt := c.buildPlaylistPrompt(request)
+	if gameContext.SystemName == "Arcade" || strings.Contains(strings.ToLower(gameContext.SystemName), "arcade") {
+		return fmt.Sprintf(`Current game context: %s (%s) - This is an arcade game.
 
-	response, err := c.SendMessage(ctx, prompt, nil, "playlist")
-	if err != nil {
-		return &PlaylistResponse{
-			Error:     "Failed to generate playlist",
-			Theme:     request.Theme,
-			Timestamp: time.Now(),
-		}, nil
+User question: %s
+
+Please provide helpful advice about this specific arcade game. Focus on gameplay tips, strategies, or interesting facts about this game.`,
+			gameContext.GameName, gameContext.SystemName, message)
 	}
 
-	if response.Error != "" {
-		return &PlaylistResponse{
-			Error:     response.Error,
-			Theme:     request.Theme,
-			Timestamp: time.Now(),
-		}, nil
-	}
+	return fmt.Sprintf(`Current game context: %s on %s
 
-	// Parse and validate game recommendations
-	games := c.parseGameRecommendations(response.Content, request.GameCount, request.InstalledGames)
+User question: %s
 
-	return &PlaylistResponse{
-		Games:     games,
-		Theme:     request.Theme,
-		Timestamp: time.Now(),
-	}, nil
+Please provide helpful advice about this specific game. Focus on gameplay tips, strategies, or interesting facts.`,
+		gameContext.GameName, gameContext.SystemName, message)
 }
 
-// buildPrompt creates a prompt with optional game context
-func (c *Client) buildPrompt(message string, gameContext *GameContext) string {
+// buildSuggestionsPrompt creates a prompt for generating game suggestions
+func (c *Client) buildSuggestionsPrompt(gameContext *GameContext) string {
 	if gameContext == nil || gameContext.GameName == "" {
-		return fmt.Sprintf("You are Claude, an AI assistant integrated into MiSTer FPGA Remote. "+
-			"Help the user with their question: %s", message)
+		return "Generate 3 brief gaming tips for retro game enthusiasts."
 	}
 
-	return fmt.Sprintf(`You are Claude, an AI assistant integrated into MiSTer FPGA Remote.
-Current context:
-- Game: %s
-- System: %s
-- Core: %s
+	return fmt.Sprintf(`Current game: %s (%s)
 
-The user is currently playing this game and asks: %s
+Generate exactly 3 brief, helpful suggestions for playing this specific game. Each suggestion should be:
+- One clear sentence
+- Actionable and specific to this game
+- About gameplay strategy, tips, or interesting mechanics
 
-Provide helpful, relevant advice based on the game context.`,
-		gameContext.GameName, gameContext.SystemName, gameContext.CoreName, message)
+Format as a simple numbered list:
+1. [suggestion]
+2. [suggestion]  
+3. [suggestion]`,
+		gameContext.GameName, gameContext.SystemName)
+}
+
+// parseSuggestions extracts suggestions from Claude's response
+func (c *Client) parseSuggestions(content string) []string {
+	lines := strings.Split(content, "\n")
+	var suggestions []string
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		// Remove list numbering
+		part := strings.TrimPrefix(line, "1. ")
+		part = strings.TrimPrefix(part, "2. ")
+		part = strings.TrimPrefix(part, "3. ")
+
+		part = strings.TrimSpace(part)
+
+		if len(part) >= 20 && len(part) <= 300 {
+			suggestions = append(suggestions, part)
+		}
+
+		if len(suggestions) >= 3 {
+			break
+		}
+	}
+
+	if len(suggestions) > 0 {
+		c.logger.Info("claude: parsed %d suggestions successfully", len(suggestions))
+		return suggestions
+	}
+
+	c.logger.Warn("claude: suggestion parsing failed, using fallback")
+	return []string{
+		"Try exploring different strategies",
+		"Check for hidden mechanics or features",
+		"Practice timing and precision",
+	}
+}
+
+// parseGameRecommendations extracts game names from Claude's playlist response
+func (c *Client) parseGameRecommendations(content string, maxGames int, installedGames []InstalledGame) []GameRecommendation {
+	lines := strings.Split(content, "\n")
+	var games []GameRecommendation
+	installed := make(map[string]bool)
+
+	// Create lookup for installed games
+	for _, game := range installedGames {
+		installed[strings.ToLower(game.Name)] = true
+	}
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Remove list markers
+		line = strings.TrimPrefix(line, "- ")
+		line = strings.TrimPrefix(line, "* ")
+		for i := 1; i <= 20; i++ {
+			line = strings.TrimPrefix(line, fmt.Sprintf("%d. ", i))
+		}
+
+		line = strings.TrimSpace(line)
+
+		if len(line) >= 3 && len(line) <= 100 {
+			games = append(games, GameRecommendation{
+				Name:        line,
+				System:      "Unknown",
+				Path:        "",
+				Description: "",
+				Reason:      "Recommended by Claude AI",
+				GeneratedAt: time.Now(),
+				Theme:       "",
+			})
+		}
+
+		if len(games) >= maxGames {
+			break
+		}
+	}
+
+	return games
+}
+
+// getOrCreateSession retrieves or creates a chat session
+func (c *Client) getOrCreateSession(sessionID string) *ChatSession {
+	c.sessionMux.Lock()
+	defer c.sessionMux.Unlock()
+
+	if sessionID == "" {
+		sessionID = "default"
+	}
+
+	session, exists := c.sessions[sessionID]
+	if !exists {
+		session = &ChatSession{
+			ID:       sessionID,
+			Messages: make([]Message, 0),
+			Created:  time.Now(),
+			Updated:  time.Now(),
+		}
+		c.sessions[sessionID] = session
+	}
+
+	return session
+}
+
+// trimSessionHistory keeps session history within configured limits
+func (c *Client) trimSessionHistory(session *ChatSession) {
+	if len(session.Messages) > c.config.ChatHistory*2 {
+		start := len(session.Messages) - c.config.ChatHistory*2
+		session.Messages = session.Messages[start:]
+	}
 }
 
 // BuildGameContext extracts current game information from tracker
@@ -317,510 +457,216 @@ func (c *Client) BuildGameContext(trk *tracker.Tracker) *GameContext {
 	return context
 }
 
-// ✅ IMPROVED: Simple SAM detection with age check only
-func (c *Client) checkSAMStatus() *SAMGameInfo {
-	samFile := "/tmp/SAM_Game.txt"
+// ✅ MODIFIED: Main function to use samindex first
+func (c *Client) extractArcadeGameName(coreName string) string {
+	c.logger.Info("claude debug: === EXTRACTING ARCADE NAME ===")
+	c.logger.Info("claude debug: Looking for arcade name for core: '%s'", coreName)
 
-	// Read SAM file
-	data, err := os.ReadFile(samFile)
+	// 🎯 PRIORITY 1: Use samindex directly (like SAM does)
+	if name := c.extractArcadeGameNameUsingSamindex(coreName); name != "" {
+		c.logger.Info("claude debug: ✅ SUCCESS via samindex: '%s' -> '%s'", coreName, name)
+		return name
+	}
+
+	// 🎯 PRIORITY 2: Fallback to previous method if samindex fails
+	c.logger.Info("claude debug: ⚠️ samindex failed, trying fallback method")
+	if name := c.extractArcadeGameNameFallback(coreName); name != "" {
+		c.logger.Info("claude debug: ✅ SUCCESS via fallback: '%s' -> '%s'", coreName, name)
+		return name
+	}
+
+	// 🎯 PRIORITY 3: Last resort - cleaned core name
+	if c.isLikelyArcadeCore(coreName) {
+		cleaned := c.cleanCoreName(coreName)
+		c.logger.Info("claude debug: ✅ LAST RESORT: Using cleaned core name '%s' -> '%s'", coreName, cleaned)
+		return cleaned
+	}
+
+	c.logger.Info("claude debug: ❌ COMPLETE FAILURE: No arcade name found for core '%s'", coreName)
+	return ""
+}
+
+// ✅ NEW IMPLEMENTATION: Use samindex directly like SAM does
+func (c *Client) extractArcadeGameNameUsingSamindex(coreName string) string {
+	c.logger.Info("claude debug: === USING SAMINDEX DIRECTLY ===")
+	c.logger.Info("claude debug: Looking for arcade game for core: '%s'", coreName)
+
+	// 1. Define paths like SAM does
+	mrsampath := "/media/fat/Scripts/.MiSTer_SAM"
+	samindexBinary := filepath.Join(mrsampath, "samindex")
+	tempGamelistPath := "/tmp"
+	gamelistFile := filepath.Join(tempGamelistPath, "arcade_gamelist.txt")
+
+	// 2. Verify samindex exists
+	if _, err := os.Stat(samindexBinary); err != nil {
+		c.logger.Error("claude debug: ❌ samindex not found at %s: %s", samindexBinary, err)
+		return ""
+	}
+
+	// 3. Execute samindex exactly like SAM: samindex -s arcade -o /tmp
+	c.logger.Info("claude debug: 🔧 Executing: %s -q -s arcade -o %s", samindexBinary, tempGamelistPath)
+	cmd := exec.Command(samindexBinary, "-q", "-s", "arcade", "-o", tempGamelistPath)
+
+	// Execute the command
+	output, err := cmd.CombinedOutput()
 	if err != nil {
-		c.logger.Info("claude debug: SAM file not found or error reading: %s", err)
-		return nil
+		c.logger.Error("claude debug: ❌ samindex execution failed: %s, output: %s", err, string(output))
+		return ""
 	}
 
-	samGameText := strings.TrimSpace(string(data))
-	c.logger.Info("claude debug: SAM file content: '%s'", samGameText)
+	c.logger.Info("claude debug: ✅ samindex executed successfully")
 
-	if samGameText == "" {
-		c.logger.Info("claude debug: SAM file is empty")
-		return nil
+	// 4. Read the generated gamelist file
+	if _, err := os.Stat(gamelistFile); err != nil {
+		c.logger.Error("claude debug: ❌ Gamelist file not found: %s", gamelistFile)
+		return ""
 	}
 
-	// ✅ Check if SAM file is too old (obsolete)
-	stat, err := os.Stat(samFile)
+	content, err := os.ReadFile(gamelistFile)
 	if err != nil {
-		c.logger.Info("claude debug: Cannot stat SAM file: %s", err)
-		return nil
+		c.logger.Error("claude debug: ❌ Could not read gamelist file: %s", err)
+		return ""
 	}
 
-	age := time.Since(stat.ModTime())
-	maxAge := 3 * time.Minute // SAM file older than 3 minutes is considered obsolete
+	c.logger.Info("claude debug: 📄 Reading gamelist with %d bytes", len(content))
 
-	c.logger.Info("claude debug: SAM file age: %v (max allowed: %v)", age, maxAge)
+	// 5. Search for the core in MRA file paths
+	lines := strings.Split(string(content), "\n")
+	coreNameLower := strings.ToLower(coreName)
 
-	if age > maxAge {
-		c.logger.Info("claude debug: SAM file is too old (%v) - treating as obsolete", age)
-		return nil
-	}
+	c.logger.Info("claude debug: 🔍 Searching for core '%s' in %d MRA files", coreName, len(lines))
 
-	samInfo := c.parseSAMGameInfo(samGameText)
-	if samInfo != nil {
-		c.logger.Info("claude debug: SAM parsed successfully - Game: '%s', Core: '%s', System: '%s'",
-			samInfo.GameName, samInfo.CoreName, samInfo.SystemName)
-	} else {
-		c.logger.Info("claude debug: SAM parsing failed for content: '%s'", samGameText)
-	}
-
-	return samInfo
-}
-
-// ✅ NEW: Check if SAM file is obsolete (multiple verification methods)
-func (c *Client) isSAMFileObsolete(samFile string) bool {
-	// Method 1: Check file age
-	if c.isSAMFileOld(samFile) {
-		c.logger.Info("claude debug: SAM file is too old (>5 minutes)")
-		return true
-	}
-
-	// Method 2: Check if SAM process is running
-	if !c.isSAMProcessRunning() {
-		c.logger.Info("claude debug: SAM process not detected")
-		return true
-	}
-
-	c.logger.Info("claude debug: SAM file appears to be current and valid")
-	return false
-}
-
-// ✅ NEW: Check if SAM file is older than 5 minutes
-func (c *Client) isSAMFileOld(samFile string) bool {
-	stat, err := os.Stat(samFile)
-	if err != nil {
-		c.logger.Info("claude debug: Cannot stat SAM file: %s", err)
-		return true // Treat errors as obsolete
-	}
-
-	age := time.Since(stat.ModTime())
-	maxAge := 5 * time.Minute
-
-	c.logger.Info("claude debug: SAM file age: %v (max allowed: %v)", age, maxAge)
-	return age > maxAge
-}
-
-// ✅ NEW: Check if SAM process is actually running
-func (c *Client) isSAMProcessRunning() bool {
-	// Check for common SAM process patterns
-	processes := []string{"MiSTer_SAM", "sam", "attract"}
-
-	for _, proc := range processes {
-		cmd := exec.Command("pgrep", "-f", proc)
-		if err := cmd.Run(); err == nil {
-			c.logger.Info("claude debug: Found SAM-related process: %s", proc)
-			return true
-		}
-	}
-
-	// Alternative: Check for SAM script execution
-	cmd := exec.Command("pgrep", "-f", "MiSTer_SAM_on.sh")
-	if err := cmd.Run(); err == nil {
-		c.logger.Info("claude debug: Found SAM script process")
-		return true
-	}
-
-	c.logger.Info("claude debug: No SAM processes detected")
-	return false
-}
-
-// Enhanced parsing with detailed logging
-func (c *Client) parseSAMGameInfo(samText string) *SAMGameInfo {
-	c.logger.Info("claude debug: === PARSING SAM INFO ===")
-	c.logger.Info("claude debug: Input text: '%s'", samText)
-
-	// Look for last opening parenthesis
-	idx := strings.LastIndex(samText, " (")
-	if idx == -1 {
-		c.logger.Info("claude debug: No opening parenthesis found")
-		return nil
-	}
-
-	gameName := samText[:idx]
-	coreInfo := samText[idx+2:] // Skip " ("
-
-	c.logger.Info("claude debug: Extracted game name: '%s'", gameName)
-	c.logger.Info("claude debug: Core info section: '%s'", coreInfo)
-
-	// Look for closing parenthesis
-	endIdx := strings.Index(coreInfo, ")")
-	if endIdx == -1 {
-		c.logger.Info("claude debug: No closing parenthesis found")
-		return nil
-	}
-
-	coreName := coreInfo[:endIdx]
-	c.logger.Info("claude debug: Extracted core name: '%s'", coreName)
-
-	// Map core to system
-	systemName := c.mapCoreToSystem(coreName)
-	c.logger.Info("claude debug: Mapped system name: '%s'", systemName)
-
-	return &SAMGameInfo{
-		GameName:   gameName,
-		CoreName:   coreName,
-		SystemName: systemName,
-	}
-}
-
-// Enhanced mapping with logging
-func (c *Client) mapCoreToSystem(coreName string) string {
-	systemMap := map[string]string{
-		"atari5200": "Atari 5200",
-		"atari2600": "Atari 2600",
-		"atari7800": "Atari 7800",
-		"nes":       "Nintendo Entertainment System",
-		"snes":      "Super Nintendo",
-		"genesis":   "Sega Genesis",
-		"megacd":    "Sega CD",
-		"s32x":      "Sega 32X",
-		"arcade":    "Arcade",
-		"neogeo":    "Neo Geo",
-		"cps1":      "Capcom CPS-1",
-		"cps2":      "Capcom CPS-2",
-		"gb":        "Game Boy",
-		"gbc":       "Game Boy Color",
-		"gba":       "Game Boy Advance",
-		"psx":       "PlayStation",
-		"saturn":    "Sega Saturn",
-		"n64":       "Nintendo 64",
-		"tgfx16":    "TurboGrafx-16",
-		"tgfx16cd":  "TurboGrafx-CD",
-		"ao486":     "PC (486)",
-		"amiga":     "Commodore Amiga",
-		"c64":       "Commodore 64",
-	}
-
-	if systemName, exists := systemMap[coreName]; exists {
-		c.logger.Info("claude debug: Core '%s' mapped to system '%s'", coreName, systemName)
-		return systemName
-	}
-
-	c.logger.Info("claude debug: Core '%s' not found in map, using as-is", coreName)
-	return coreName // Fallback to core name
-}
-
-func HandleDebugSAM(logger *service.Logger) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		samData, _ := os.ReadFile("/tmp/SAM_Game.txt")
-		activeData, _ := os.ReadFile("/tmp/ACTIVEGAME")
-
-		debug := map[string]interface{}{
-			"sam_game":    strings.TrimSpace(string(samData)),
-			"active_game": strings.TrimSpace(string(activeData)),
-			"sam_active":  len(samData) > 0,
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(debug)
-	}
-}
-
-// buildPlaylistPromptGeneric provides fallback for when no games are provided
-func (c *Client) buildPlaylistPromptGeneric(request *PlaylistRequest) string {
-	prompt := fmt.Sprintf("Generate exactly %d game recommendations for the theme: %s\n",
-		request.GameCount, request.Theme)
-
-	if len(request.Systems) > 0 {
-		prompt += fmt.Sprintf("Focus on these systems: %v\n", request.Systems)
-	}
-
-	if request.Preferences != "" {
-		prompt += fmt.Sprintf("User preferences: %s\n", request.Preferences)
-	}
-
-	prompt += `
-RANDOMIZATION REQUIREMENT:
-- Do NOT list games in alphabetical order
-- ACTIVELY AVOID alphabetical patterns (A, B, C games)
-- Mix different starting letters randomly in your recommendations
-- Prioritize theme relevance over alphabetical ordering
-- Ensure variety in the first letters of recommended games (avoid clustering around A-D)
-
-Format each game as: Game Name | System | Brief description | Why recommended`
-	return prompt
-}
-
-// ✅ IMPROVED: parseGameRecommendations with anti-bias fuzzy matching
-func (c *Client) parseGameRecommendations(content string, count int, installedGames []InstalledGame) []GameRecommendation {
-	c.logger.Info("=== CLAUDE'S RAW RESPONSE ===")
-	c.logger.Info("Response length: %d characters", len(content))
-	c.logger.Info("Full response: %s", content)
-	c.logger.Info("==============================")
-	recommendations := make([]GameRecommendation, 0, count)
-
-	// Create fast lookup map of installed games
-	installedMap := make(map[string]InstalledGame)
-	// ✅ CRITICAL: Also create a randomized slice for unbiased fuzzy matching
-	gamesList := make([]InstalledGame, len(installedGames))
-	copy(gamesList, installedGames)
-
-	// Randomize the games list for fuzzy matching to prevent alphabetical bias
-	baseTime := time.Now().UnixNano() + 7777 // Different seed
-	for i := len(gamesList) - 1; i > 0; i-- {
-		seed := baseTime + int64(i*3000) + int64(len(gamesList)*300)
-		j := int(seed) % (i + 1)
-		if j < 0 {
-			j = -j
-		}
-		gamesList[i], gamesList[j] = gamesList[j], gamesList[i]
-	}
-
-	// Build the lookup map
-	for _, game := range installedGames {
-		// Normalize name for search
-		key := strings.ToLower(strings.TrimSpace(game.Name))
-		installedMap[key] = game
-	}
-
-	// Split by double newlines first, then single newlines as backup
-	var lines []string
-	if strings.Contains(content, "\n\n") {
-		parts := strings.Split(content, "\n\n")
-		// Take each part and split by single newlines too
-		for _, part := range parts {
-			subLines := strings.Split(strings.TrimSpace(part), "\n")
-			lines = append(lines, subLines...)
-		}
-	} else {
-		lines = strings.Split(strings.TrimSpace(content), "\n")
-	}
-
-	for _, line := range lines {
+	for i, line := range lines {
 		line = strings.TrimSpace(line)
-
-		// Skip empty lines or lines that don't contain pipes
-		if line == "" || !strings.Contains(line, "|") {
+		if line == "" {
 			continue
 		}
 
-		// Skip lines that look like headers or intro text
-		if strings.Contains(strings.ToLower(line), "recommendations") ||
-			strings.Contains(strings.ToLower(line), "here are") {
-			continue
+		// Log first 5 lines for debugging
+		if i < 5 {
+			c.logger.Info("claude debug: Sample MRA line %d: %s", i+1, line)
 		}
 
-		// Split by pipe character
-		parts := strings.Split(line, "|")
+		// Extract filename without extension
+		filename := filepath.Base(line)
+		nameWithoutExt := strings.TrimSuffix(filename, ".mra")
+		nameWithoutExtLower := strings.ToLower(nameWithoutExt)
 
-		// Should have exactly 4 parts: Name | System | Description | Reason
-		if len(parts) != 4 {
-			continue
-		}
+		// Look for match with core name
+		if strings.Contains(nameWithoutExtLower, coreNameLower) {
+			c.logger.Info("claude debug: 🎯 MATCH FOUND: '%s' matches '%s'", coreName, nameWithoutExt)
 
-		// Clean up each part
-		name := strings.TrimSpace(parts[0])
-		system := strings.TrimSpace(parts[1])
-		description := strings.TrimSpace(parts[2])
-		reason := strings.TrimSpace(parts[3])
-
-		// Validate that we have meaningful content
-		if len(name) < 2 || len(system) < 2 || len(description) < 10 {
-			continue
-		}
-
-		// ✅ NEW: Validate game exists in user's collection (only if installed games provided)
-		var installedGame InstalledGame
-		var gameFound bool = true
-
-		if len(installedGames) > 0 {
-			normalizedName := strings.ToLower(strings.TrimSpace(name))
-			installedGame, gameFound = installedMap[normalizedName]
-
-			if !gameFound {
-				// ✅ FIXED: Use randomized slice instead of map iteration to prevent bias
-				for _, installed := range gamesList {
-					installedName := strings.ToLower(strings.TrimSpace(installed.Name))
-					if strings.Contains(installedName, normalizedName) ||
-						strings.Contains(normalizedName, installedName) {
-						installedGame = installed
-						gameFound = true
-						break
-					}
-				}
-				if !gameFound {
-					c.logger.Warn("claude playlist: game '%s' not found in collection, skipping", name)
-					continue
-				}
+			// Try to extract full name from MRA file
+			if fullName := c.extractGameNameFromMRA(line); fullName != "" {
+				c.logger.Info("claude debug: ✅ SUCCESS: Extracted full name from MRA: '%s'", fullName)
+				return fullName
 			}
 
-			// Use actual game path from collection
-			if gameFound {
-				name = installedGame.Name     // Use exact name from collection
-				system = installedGame.System // Use exact system name
-			}
-		} else {
-			// No validation possible, use Claude's data as-is
-			installedGame = InstalledGame{
-				Name:   name,
-				System: system,
-			}
-		}
-
-		recommendation := GameRecommendation{
-			Name:        name,
-			System:      system,
-			Path:        installedGame.Path,
-			Description: description,
-			Reason:      reason,
-			GeneratedAt: time.Now(),
-		}
-
-		recommendations = append(recommendations, recommendation)
-
-		// Stop if we have enough recommendations
-		if len(recommendations) >= count {
-			break
+			// Fallback to filename
+			c.logger.Info("claude debug: ✅ SUCCESS: Using filename: '%s'", nameWithoutExt)
+			return nameWithoutExt
 		}
 	}
 
-	// ✅ BALANCE CHECK: If multiple systems were requested, try to balance recommendations
-	if len(recommendations) > 1 {
-		recommendations = c.verifySystemBalance(recommendations, []string{}, count)
-	}
-	c.logger.Info("=== FINAL PARSED RECOMMENDATIONS ===")
-	for i, rec := range recommendations {
-		c.logger.Info("  %d: %s (%s)", i+1, rec.Name, rec.System)
-	}
-	c.logger.Info("=====================================")
-
-	return recommendations
+	c.logger.Info("claude debug: ❌ No match found for core '%s' in arcade gamelist", coreName)
+	return ""
 }
 
-// ✅ NEW: Verify and improve system balance in recommendations
-func (c *Client) verifySystemBalance(recommendations []GameRecommendation, targetSystems []string, targetCount int) []GameRecommendation {
-	if len(targetSystems) <= 1 || len(recommendations) <= len(targetSystems) {
-		return recommendations // No balance needed
+// ✅ RENAMED: Previous method as fallback
+func (c *Client) extractArcadeGameNameFallback(coreName string) string {
+	c.logger.Info("claude debug: === FALLBACK METHOD ===")
+
+	arcadeDir := "/media/fat/_Arcade"
+
+	entries, err := os.ReadDir(arcadeDir)
+	if err != nil {
+		c.logger.Error("claude debug: ❌ Could not read _Arcade directory: %s", err)
+		return ""
 	}
 
-	// Count games per system
-	systemCounts := make(map[string]int)
-	systemGames := make(map[string][]GameRecommendation)
+	c.logger.Info("claude debug: Found %d entries in _Arcade directory", len(entries))
 
-	for _, rec := range recommendations {
-		systemCounts[rec.System]++
-		systemGames[rec.System] = append(systemGames[rec.System], rec)
-	}
+	coreNameLower := strings.ToLower(coreName)
+	bestMatch := ""
+	bestMatchPath := ""
+	bestScore := 0
+	totalMraFiles := 0
 
-	// Check if balance is good enough (no system should have more than 50% of total)
-	maxAllowed := targetCount / 2
-	if maxAllowed < 1 {
-		maxAllowed = 1
-	}
-
-	needsRebalancing := false
-	for _, count := range systemCounts {
-		if count > maxAllowed {
-			needsRebalancing = true
-			break
-		}
-	}
-
-	// Check if any selected system is completely missing
-	for _, system := range targetSystems {
-		if systemCounts[system] == 0 {
-			needsRebalancing = true
-			break
-		}
-	}
-
-	if !needsRebalancing {
-		return recommendations // Balance is acceptable
-	}
-
-	c.logger.Info("claude playlist: rebalancing recommendations across systems")
-
-	// Create a more balanced selection
-	targetPerSystem := targetCount / len(targetSystems)
-	remainder := targetCount % len(targetSystems)
-
-	var balanced []GameRecommendation
-	usedGames := make(map[string]bool)
-
-	// First pass: try to get targetPerSystem from each system
-	for _, system := range targetSystems {
-		count := 0
-		target := targetPerSystem
-		if remainder > 0 {
-			target++
-			remainder--
-		}
-
-		for _, game := range systemGames[system] {
-			if count >= target {
-				break
-			}
-			if !usedGames[game.Name] {
-				balanced = append(balanced, game)
-				usedGames[game.Name] = true
-				count++
-			}
-		}
-	}
-
-	// Second pass: fill remaining slots from any system
-	if len(balanced) < targetCount {
-		for _, rec := range recommendations {
-			if len(balanced) >= targetCount {
-				break
-			}
-			if !usedGames[rec.Name] {
-				balanced = append(balanced, rec)
-				usedGames[rec.Name] = true
-			}
-		}
-	}
-
-	c.logger.Info("claude playlist: rebalanced %d games across %d systems", len(balanced), len(targetSystems))
-	return balanced
-}
-
-// parseSuggestions extracts suggestions from Claude's response
-func (c *Client) parseSuggestions(content string) []string {
-	var parts []string
-
-	if strings.Contains(content, "\n\n") {
-		parts = strings.Split(strings.TrimSpace(content), "\n\n")
-	} else {
-		parts = strings.Split(strings.TrimSpace(content), "\n")
-	}
-
-	suggestions := make([]string, 0)
-
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-
-		if part == "" {
+	// Find best match by filename
+	for _, entry := range entries {
+		if entry.IsDir() {
 			continue
 		}
 
-		// Remove common prefixes
-		part = strings.TrimPrefix(part, "- ")
-		part = strings.TrimPrefix(part, "• ")
-		part = strings.TrimPrefix(part, "* ")
-		part = strings.TrimPrefix(part, "1. ")
-		part = strings.TrimPrefix(part, "2. ")
-		part = strings.TrimPrefix(part, "3. ")
-
-		part = strings.TrimSpace(part)
-
-		if len(part) >= 20 && len(part) <= 300 {
-			suggestions = append(suggestions, part)
+		filename := entry.Name()
+		if !strings.HasSuffix(strings.ToLower(filename), ".mra") {
+			continue
 		}
 
-		if len(suggestions) >= 3 {
-			break
+		totalMraFiles++
+
+		nameWithoutExt := strings.TrimSuffix(filename, ".mra")
+		nameWithoutExtLower := strings.ToLower(nameWithoutExt)
+
+		// Extract base name (before first parenthesis)
+		baseName := nameWithoutExt
+		if idx := strings.Index(nameWithoutExt, "("); idx != -1 {
+			baseName = strings.TrimSpace(nameWithoutExt[:idx])
+		}
+		baseNameLower := strings.ToLower(baseName)
+
+		// Calculate score
+		score := c.calculateMatchScore(coreNameLower, baseNameLower, nameWithoutExtLower)
+
+		if score > bestScore {
+			bestScore = score
+			bestMatch = baseName
+			bestMatchPath = filepath.Join(arcadeDir, filename)
 		}
 	}
 
-	if len(suggestions) > 0 {
-		c.logger.Info("claude: parsed %d suggestions successfully", len(suggestions))
-		return suggestions
+	c.logger.Info("claude debug: Processed %d .mra files, best score: %d", totalMraFiles, bestScore)
+
+	if bestScore == 0 {
+		return ""
 	}
 
-	c.logger.Warn("claude: suggestion parsing failed, using fallback")
-	return []string{
-		"Try exploring different strategies",
-		"Check for hidden mechanics or features",
-		"Practice timing and precision",
+	// Try to extract from XML if we have a match
+	if bestMatchPath != "" {
+		if xmlName := c.extractGameNameFromMRA(bestMatchPath); xmlName != "" {
+			return xmlName
+		}
 	}
+
+	// Minimum score to accept
+	if bestScore >= 50 {
+		return bestMatch
+	}
+
+	return ""
+}
+
+// ✅ NEW: Function to clean core names
+func (c *Client) cleanCoreName(coreName string) string {
+	// Remove common numbers and special characters
+	cleaned := coreName
+	cleaned = strings.TrimSuffix(cleaned, "h") // ssf2h -> ssf2
+	cleaned = strings.TrimSuffix(cleaned, "t") // ssf2t -> ssf2
+
+	// Convert known abbreviations
+	replacements := map[string]string{
+		"ssf2": "Super Street Fighter II",
+		"sf2":  "Street Fighter II",
+		"mk":   "Mortal Kombat",
+		"kof":  "King of Fighters",
+		"ms":   "Metal Slug",
+	}
+
+	if replacement, exists := replacements[strings.ToLower(cleaned)]; exists {
+		return replacement
+	}
+
+	return cleaned
 }
 
 // calculateMatchScore computes similarity between core and game names
@@ -903,473 +749,146 @@ func (c *Client) similarStrings(a, b string) bool {
 		}
 	}
 
-	return float64(commonChars)/float64(len(shorter)) >= 0.7
+	return float64(commonChars)/float64(len(shorter)) > 0.6
 }
 
-// isLikelyArcadeCore determines if a core name likely represents an arcade game
+// isLikelyArcadeCore determines if a core name suggests an arcade game
 func (c *Client) isLikelyArcadeCore(coreName string) bool {
-	knownSystems := []string{
-		// CONSOLES
-		"AdventureVision", "Arcadia", "Astrocade", "Atari2600", "Atari5200", "Atari7800",
-		"AtariLynx", "CasioPV1000", "CasioPV2000", "ChannelF", "ColecoVision", "CreatiVision",
-		"FDS", "Gamate", "Gameboy", "Gameboy2P", "GameboyColor", "GameNWatch", "GBA", "GBA2P",
-		"Genesis", "Intellivision", "Jaguar", "MasterSystem", "MegaDuck", "NES", "NeoGeo",
-		"NeoGeoCD", "Nintendo64", "Odyssey2", "PCFX", "PokemonMini", "PSX", "Saturn", "Sega32X",
-		"SegaCD", "SG1000", "SMS", "SNES", "SuperGameboy", "SuperGrafx", "SuperVision",
-		"Tamagotchi", "TurboGrafx16", "TurboGrafx16CD", "VC4000", "Vectrex", "WonderSwan",
-		"WonderSwanColor",
-
-		// COMPUTERS
-		"AcornAtom", "AcornElectron", "AliceMC10", "Amiga", "AmigaCD32", "Amstrad", "AmstradPCW",
-		"Apogee", "AppleI", "AppleII", "Aquarius", "Atari800", "AtariST", "BBCMicro", "BK0011M",
-		"C64", "ChipTest", "CoCo2", "CoCo3", "EDSAC", "Galaksija", "Interact", "Jupiter",
-		"Laser", "Lynx48", "Macintosh", "MegaST", "MO5", "MSX", "MultiComp", "Orao", "Oric",
-		"PC88", "PDP1", "PET2001", "PMD85", "RX78", "SAMCoupe", "SharpMZ", "SordM5",
-		"Specialist", "TI994A", "TRS80", "TSConf", "UK101", "Vector06", "VIC20", "X68000",
-		"ZX81", "ZXSpectrum",
-
-		// OTHER SYSTEMS
-		"Arduboy", "Chip8", "FlappyBird", "Groovy",
-
-		// COMMON ALIASES
-		"TGFX16", "PCE", "GG", "GameGear", "N64", "A7800", "LYNX", "NGP", "WS",
+	if coreName == "" {
+		return false
 	}
 
-	for _, system := range knownSystems {
-		if strings.EqualFold(coreName, system) {
+	// Known non-arcade systems
+	nonArcadeSystems := []string{
+		"nes", "snes", "genesis", "megadrive", "n64", "psx", "saturn",
+		"gb", "gbc", "gba", "gg", "sms", "tgfx16", "neogeo",
+		"atari", "c64", "amiga", "ao486", "minimig",
+	}
+
+	coreNameLower := strings.ToLower(coreName)
+	for _, system := range nonArcadeSystems {
+		if strings.Contains(coreNameLower, system) {
 			return false
 		}
 	}
 
-	// Typical arcade patterns
-	arcadePatterns := []string{
-		"194", "195", "196", "197", "198", "199",
-		"pac", "kong", "man", "fighter", "force", "strike",
-	}
-
-	coreNameLower := strings.ToLower(coreName)
-	for _, pattern := range arcadePatterns {
-		if strings.Contains(coreNameLower, pattern) {
-			return true
-		}
-	}
-
-	// Only if the name is very short AND not in known systems
-	return len(coreName) <= 8
+	// If it's a short name without clear system indicators, likely arcade
+	return len(coreName) <= 8 && !strings.Contains(coreName, "/")
 }
 
-// cleanCoreName cleans up a core name for display
-func (c *Client) cleanCoreName(coreName string) string {
-	name := strings.TrimSuffix(coreName, ".rbf")
-	name = strings.TrimSuffix(name, "_MiSTer")
+// ✅ IMPROVED: Simple SAM detection with age check only
+func (c *Client) checkSAMStatus() *SAMGameInfo {
+	samFile := "/tmp/SAM_Game.txt"
 
-	words := strings.Fields(name)
-	for i, word := range words {
-		if len(word) > 0 {
-			words[i] = strings.Title(strings.ToLower(word))
-		}
-	}
-
-	return strings.Join(words, " ")
-}
-
-// callAnthropicAPI makes the actual HTTP request to Claude API
-func (c *Client) callAnthropicAPI(ctx context.Context, request *AnthropicRequest) (*AnthropicResponse, error) {
-	jsonData, err := json.Marshal(request)
+	// Read SAM file
+	data, err := os.ReadFile(samFile)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
+		c.logger.Info("claude debug: SAM file not found or error reading: %s", err)
+		return nil
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", anthropicAPIURL, bytes.NewBuffer(jsonData))
+	samGameText := strings.TrimSpace(string(data))
+	c.logger.Info("claude debug: SAM file content: '%s'", samGameText)
+
+	if samGameText == "" {
+		c.logger.Info("claude debug: SAM file is empty")
+		return nil
+	}
+
+	// ✅ Check if SAM file is too old (obsolete)
+	stat, err := os.Stat(samFile)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		c.logger.Info("claude debug: Cannot stat SAM file: %s", err)
+		return nil
 	}
 
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-API-Key", c.config.APIKey)
-	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("anthropic-version", "2023-06-01")
+	age := time.Since(stat.ModTime())
+	maxAge := 3 * time.Minute // SAM file older than 3 minutes is considered obsolete
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("http request failed: %w", err)
-	}
-	defer resp.Body.Close()
+	c.logger.Info("claude debug: SAM file age: %v (max allowed: %v)", age, maxAge)
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("api returned status %d", resp.StatusCode)
+	if age > maxAge {
+		c.logger.Info("claude debug: SAM file is too old (%v) - treating as obsolete", age)
+		return nil
 	}
 
-	var apiResponse AnthropicResponse
-	err = json.NewDecoder(resp.Body).Decode(&apiResponse)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+	samInfo := c.parseSAMGameInfo(samGameText)
+	if samInfo != nil {
+		c.logger.Info("claude debug: SAM parsed successfully - Game: '%s', Core: '%s', System: '%s'",
+			samInfo.GameName, samInfo.CoreName, samInfo.SystemName)
+	} else {
+		c.logger.Info("claude debug: SAM parsing failed for content: '%s'", samGameText)
 	}
 
-	return &apiResponse, nil
+	return samInfo
 }
 
-// getOrCreateSession gets or creates a chat session
-func (c *Client) getOrCreateSession(sessionID string) *ChatSession {
-	c.sessionMux.Lock()
-	defer c.sessionMux.Unlock()
+// Enhanced parsing with detailed logging
+func (c *Client) parseSAMGameInfo(samText string) *SAMGameInfo {
+	c.logger.Info("claude debug: === PARSING SAM INFO ===")
+	c.logger.Info("claude debug: Input text: '%s'", samText)
 
-	if sessionID == "" {
-		sessionID = fmt.Sprintf("session_%d", time.Now().Unix())
+	// Look for last opening parenthesis
+	idx := strings.LastIndex(samText, " (")
+	if idx == -1 {
+		c.logger.Info("claude debug: No opening parenthesis found")
+		return nil
 	}
 
-	session, exists := c.sessions[sessionID]
-	if !exists {
-		session = &ChatSession{
-			ID:       sessionID,
-			Messages: make([]Message, 0),
-			Created:  time.Now(),
-			Updated:  time.Now(),
-		}
-		c.sessions[sessionID] = session
+	gameName := samText[:idx]
+	coreInfo := samText[idx+2:] // Skip " ("
+
+	c.logger.Info("claude debug: Extracted game name: '%s'", gameName)
+	c.logger.Info("claude debug: Core info section: '%s'", coreInfo)
+
+	// Look for closing parenthesis
+	endIdx := strings.Index(coreInfo, ")")
+	if endIdx == -1 {
+		c.logger.Info("claude debug: No closing parenthesis found")
+		return nil
 	}
 
-	return session
+	coreName := coreInfo[:endIdx]
+	c.logger.Info("claude debug: Extracted core name: '%s'", coreName)
+
+	// Map core to system
+	systemName := c.mapCoreToSystem(coreName)
+	c.logger.Info("claude debug: Mapped system name: '%s'", systemName)
+
+	return &SAMGameInfo{
+		GameName:   gameName,
+		CoreName:   coreName,
+		SystemName: systemName,
+	}
 }
 
-// trimSessionHistory keeps session history within configured limits
-func (c *Client) trimSessionHistory(session *ChatSession) {
-	if len(session.Messages) > c.config.ChatHistory*2 {
-		start := len(session.Messages) - c.config.ChatHistory*2
-		session.Messages = session.Messages[start:]
-	}
-}
-
-// =========================================
-// ADD THESE NEW FUNCTIONS TO client.go
-// Do NOT replace existing functions
-// =========================================
-
-// GeneratePlaylistFromActiveGame creates a playlist based on the currently active game
-func (c *Client) GeneratePlaylistFromActiveGame(ctx context.Context, request *PlaylistRequest, trk *tracker.Tracker) (*PlaylistResponse, error) {
-	if !c.config.Enabled {
-		return &PlaylistResponse{
-			Error:     "Claude is disabled",
-			Timestamp: time.Now(),
-		}, nil
-	}
-
-	// Get current game context
-	gameContext := c.BuildGameContext(trk)
-	if gameContext.GameName == "" {
-		return &PlaylistResponse{
-			Error:     "No game currently active to base playlist on",
-			Theme:     request.Theme,
-			Timestamp: time.Now(),
-		}, nil
+// Enhanced mapping with logging
+func (c *Client) mapCoreToSystem(coreName string) string {
+	systemMap := map[string]string{
+		"atari5200": "Atari 5200",
+		"atari2600": "Atari 2600",
+		"atari7800": "Atari 7800",
+		"nes":       "Nintendo Entertainment System",
+		"snes":      "Super Nintendo",
+		"genesis":   "Sega Genesis",
+		"megacd":    "Sega CD",
+		"s32x":      "Sega 32X",
+		"arcade":    "Arcade",
+		"neogeo":    "SNK NeoGeo",
+		"psx":       "Sony PlayStation",
+		"saturn":    "Sega Saturn",
+		"n64":       "Nintendo 64",
+		"gb":        "Game Boy",
+		"gbc":       "Game Boy Color",
+		"gba":       "Game Boy Advance",
 	}
 
-	// Build specialized prompt for active game
-	prompt := c.buildActiveGamePlaylistPrompt(request, gameContext)
-
-	response, err := c.SendMessage(ctx, prompt, gameContext, "playlist")
-	if err != nil {
-		return &PlaylistResponse{
-			Error:     "Failed to generate playlist based on active game",
-			Theme:     request.Theme,
-			Timestamp: time.Now(),
-		}, nil
+	if system, exists := systemMap[strings.ToLower(coreName)]; exists {
+		return system
 	}
 
-	if response.Error != "" {
-		return &PlaylistResponse{
-			Error:     response.Error,
-			Theme:     request.Theme,
-			Timestamp: time.Now(),
-		}, nil
-	}
-
-	// Parse and validate game recommendations
-	games := c.parseGameRecommendations(response.Content, request.GameCount, request.InstalledGames)
-
-	// Set theme to reflect active game context
-	finalTheme := request.Theme
-	if finalTheme == "" {
-		finalTheme = fmt.Sprintf("Games similar to %s", gameContext.GameName)
-	}
-
-	return &PlaylistResponse{
-		Games:     games,
-		Theme:     finalTheme,
-		Timestamp: time.Now(),
-	}, nil
-}
-
-// buildActiveGamePlaylistPrompt creates a specialized prompt for active game-based playlists
-func (c *Client) buildActiveGamePlaylistPrompt(request *PlaylistRequest, gameContext *GameContext) string {
-	if len(request.InstalledGames) == 0 {
-		// Fallback to generic recommendations if no games provided
-		return c.buildActiveGamePlaylistPromptGeneric(request, gameContext)
-	}
-
-	// Build list of user's actual games for Claude
-	var gamesList strings.Builder
-	gamesList.WriteString("AVAILABLE GAMES IN USER'S COLLECTION:\n\n")
-
-	// Group games by system for better organization
-	systemGames := make(map[string][]InstalledGame)
-	for _, game := range request.InstalledGames {
-		systemGames[game.System] = append(systemGames[game.System], game)
-	}
-
-	for system, games := range systemGames {
-		gamesList.WriteString(fmt.Sprintf("%s (%d games available):\n", system, len(games)))
-
-		// ✅ SAME FIX: Apply the same randomization as in buildPlaylistPrompt
-		orderedGames := make([]InstalledGame, len(games))
-		copy(orderedGames, games)
-
-		// Reverse the list to start with Z instead of A
-		for i, j := 0, len(orderedGames)-1; i < j; i, j = i+1, j-1 {
-			orderedGames[i], orderedGames[j] = orderedGames[j], orderedGames[i]
-		}
-
-		// Add time-based rotation to vary the starting point
-		offset := int(time.Now().Second()) % len(orderedGames)
-		rotatedGames := make([]InstalledGame, len(orderedGames))
-		for i, game := range orderedGames {
-			newIndex := (i + offset) % len(orderedGames)
-			rotatedGames[newIndex] = game
-		}
-
-		for _, game := range rotatedGames {
-			gamesList.WriteString(fmt.Sprintf("- %s\n", game.Name))
-		}
-		gamesList.WriteString("\n")
-	}
-
-	// Determine the theme context
-	themeContext := ""
-	if request.Theme != "" && !isActiveGameThemeKeyword(request.Theme) {
-		themeContext = fmt.Sprintf(" with focus on: %s", request.Theme)
-	}
-
-	prompt := fmt.Sprintf(`You are generating a curated game playlist for a MiSTer FPGA user based on their currently active game.
-
-CURRENTLY PLAYING: %s (%s system)
-REQUESTED COUNT: %d games
-SELECTED SYSTEMS: %v
-
-%s
-
-CORE INSTRUCTION:
-Generate a playlist of games similar to "%s" that the user is currently playing%s.
-
-SIMILARITY CRITERIA:
-- Genre and gameplay style
-- Art style and visual presentation  
-- Difficulty level and game mechanics
-- Time period or setting (if relevant)
-- Overall "feel" and atmosphere
-
-CRITICAL REQUIREMENTS:
-- You MUST only recommend games from the user's collection listed above
-- Do NOT recommend games that are not in the list
-- Do NOT include the currently active game ("%s") in the recommendations
-- Focus on games that share DNA with the active game
-- If multiple systems are selected, provide variety across systems when possible
-- Prioritize quality matches over quantity
-
-RANDOMIZATION REQUIREMENT:
-- Do NOT list games in alphabetical order
-- ACTIVELY AVOID alphabetical patterns (A, B, C games)  
-- Mix different starting letters randomly in your recommendations
-- Prioritize similarity to "%s" over alphabetical ordering
-- If you notice alphabetical bias, deliberately break it by choosing games that start with different letters
-- Ensure variety in the first letters of recommended games (avoid clustering around A-D)
-
-FORMAT REQUIREMENTS:
-Format each recommendation exactly as:
-Game Name | System | Brief description | Why it's similar to %s
-
-Only recommend games that appear exactly in the user's collection above.`,
-		gameContext.GameName,
-		gameContext.SystemName,
-		request.GameCount,
-		request.Systems,
-		gamesList.String(),
-		gameContext.GameName,
-		themeContext,
-		gameContext.GameName,
-		gameContext.GameName,
-		gameContext.GameName)
-
-	return prompt
-}
-
-// buildActiveGamePlaylistPromptGeneric provides fallback for when no games are provided
-func (c *Client) buildActiveGamePlaylistPromptGeneric(request *PlaylistRequest, gameContext *GameContext) string {
-	themeContext := ""
-	if request.Theme != "" && !isActiveGameThemeKeyword(request.Theme) {
-		themeContext = fmt.Sprintf(" with focus on: %s", request.Theme)
-	}
-
-	prompt := fmt.Sprintf(`Generate exactly %d game recommendations similar to "%s" (%s system)%s.
-
-Look for games that share:
-- Similar gameplay mechanics
-- Comparable visual style
-- Similar difficulty or complexity
-- Related themes or settings
-
-RANDOMIZATION REQUIREMENT:
-- Do NOT list games in alphabetical order
-- ACTIVELY AVOID alphabetical patterns (A, B, C games)
-- Mix different starting letters randomly in your recommendations
-- Prioritize similarity to "%s" over alphabetical ordering
-- Ensure variety in the first letters of recommended games (avoid clustering around A-D)
-
-`,
-		request.GameCount, gameContext.GameName, gameContext.SystemName, themeContext, gameContext.GameName)
-
-	if len(request.Systems) > 0 {
-		prompt += fmt.Sprintf("Focus on these systems: %v\n", request.Systems)
-	}
-
-	if request.Preferences != "" {
-		prompt += fmt.Sprintf("User preferences: %s\n", request.Preferences)
-	}
-
-	prompt += "Format each game as: Game Name | System | Brief description | Why it's similar"
-	return prompt
-}
-
-// GetActiveGameSuggestion returns a dynamic suggestion based on the current active game
-func (c *Client) GetActiveGameSuggestion(trk *tracker.Tracker) string {
-	gameContext := c.BuildGameContext(trk)
-	if gameContext.GameName == "" {
-		return "Similar games to active game" // fallback when no game is active
-	}
-
-	return fmt.Sprintf("Games similar to %s", gameContext.GameName)
-}
-
-func (c *Client) buildPlaylistPrompt(request *PlaylistRequest) string {
-	if len(request.InstalledGames) == 0 {
-		// Fallback to generic recommendations if no games provided
-		return c.buildPlaylistPromptGeneric(request)
-	}
-
-	// ✅ QUICK DEBUG: Log the raw games we're sending to Claude
-	c.logger.Info("=== CLAUDE INPUT DEBUG ===")
-	c.logger.Info("Theme: %s", request.Theme)
-	c.logger.Info("Games being sent to Claude (first 15):")
-	for i := 0; i < 15 && i < len(request.InstalledGames); i++ {
-		game := request.InstalledGames[i]
-		c.logger.Info("  %d: %s (%s)", i+1, game.Name, game.System)
-	}
-	c.logger.Info("==========================")
-
-	// Build list of user's actual games for Claude
-	var gamesList strings.Builder
-	gamesList.WriteString("AVAILABLE GAMES IN USER'S COLLECTION:\n\n")
-
-	// Group games by system for better organization and balance analysis
-	systemGames := make(map[string][]InstalledGame)
-	for _, game := range request.InstalledGames {
-		systemGames[game.System] = append(systemGames[game.System], game)
-	}
-
-	// ✅ NEW: Calculate target games per system for balanced distribution
-	targetPerSystem := ""
-	if len(request.Systems) > 1 && request.GameCount > len(request.Systems) {
-		minPerSystem := request.GameCount / len(request.Systems)
-		remainder := request.GameCount % len(request.Systems)
-
-		if minPerSystem > 0 {
-			targetPerSystem = fmt.Sprintf("\nTARGET DISTRIBUTION: Aim for %d-%d games per system to ensure balanced variety.",
-				minPerSystem, minPerSystem+1)
-			if remainder > 0 {
-				targetPerSystem += fmt.Sprintf(" (%d systems can have +1 extra game)", remainder)
-			}
-		}
-	}
-
-	// ✅ SIMPLE FIX: Reverse order + time-based rotation
-	for system, games := range systemGames {
-		gamesList.WriteString(fmt.Sprintf("%s (%d games available):\n", system, len(games)))
-
-		// ✅ SIMPLE FIX: Reverse order + time-based rotation
-		orderedGames := make([]InstalledGame, len(games))
-		copy(orderedGames, games)
-
-		// Reverse the list to start with Z instead of A
-		for i, j := 0, len(orderedGames)-1; i < j; i, j = i+1, j-1 {
-			orderedGames[i], orderedGames[j] = orderedGames[j], orderedGames[i]
-		}
-
-		// Add time-based rotation to vary the starting point
-		offset := int(time.Now().Second()) % len(orderedGames)
-		rotatedGames := make([]InstalledGame, len(orderedGames))
-		for i, game := range orderedGames {
-			newIndex := (i + offset) % len(orderedGames)
-			rotatedGames[newIndex] = game
-		}
-
-		for _, game := range rotatedGames {
-			gamesList.WriteString(fmt.Sprintf("- %s\n", game.Name))
-		}
-		gamesList.WriteString("\n")
-	}
-
-	prompt := fmt.Sprintf(`You are generating a curated game playlist for a MiSTer FPGA user.
-
-THEME: %s
-REQUESTED COUNT: %d games
-SELECTED SYSTEMS: %v%s
-
-%s
-
-CRITICAL INSTRUCTIONS:
-- You MUST only recommend games from the user's collection listed above
-- Do NOT recommend games that are not in the list
-- Select games that best match the theme "%s"
-- BALANCE REQUIREMENT: When multiple systems are selected, provide good variety across ALL selected systems
-- Avoid recommending all games from just one or two systems
-- Focus on quality and theme relevance while maintaining system balance
-- If a system has fewer games available, that's acceptable, but try to include at least 1-2 games from each system when possible
-
-EXTREMELY IMPORTANT - ALPHABETICAL DIVERSITY REQUIREMENT:
-- Do NOT list games in alphabetical order under ANY circumstances
-- ACTIVELY AVOID recommending multiple games that start with the same letter
-- Mix different starting letters randomly in your recommendations
-- Prioritize theme relevance over alphabetical ordering
-- If you notice your recommendations start with similar letters (like A, B, C), STOP and choose games that start with different letters instead
-- Ensure variety in the first letters of recommended games (avoid clustering around A-D)
-- This is CRITICAL - users have complained about alphabetical bias in recommendations
-
-FORMAT REQUIREMENTS:
-Format each recommendation exactly as:
-Game Name | System | Brief description | Why it fits the theme
-
-Only recommend games that appear exactly in the user's collection above.`,
-		request.Theme,
-		request.GameCount,
-		request.Systems,
-		targetPerSystem,
-		gamesList.String(),
-		request.Theme)
-
-	// ✅ QUICK DEBUG: Log the actual prompt sent to Claude
-	c.logger.Info("=== PROMPT SENT TO CLAUDE ===")
-	c.logger.Info("Full prompt length: %d characters", len(prompt))
-	c.logger.Info("Prompt preview (first 500 chars): %s", prompt[:min(len(prompt), 500)])
-	c.logger.Info("==============================")
-
-	return prompt
-}
-
-// Helper function for min (add at the end of the file if it doesn't exist)
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
+	// Default to titlecase of core name
+	return strings.Title(coreName)
 }
 
 // ✅ FINAL FIX: Extract game name from MRA XML with correct patterns
@@ -1436,10 +955,564 @@ func (c *Client) extractGameNameFromMRA(mraPath string) string {
 	return ""
 }
 
-// ✅ FINAL: Improved extractArcadeGameName with better debug and lower threshold
+// Helper function for min (add at the end of the file if it doesn't exist)
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// NewClient creates a new Claude AI client
+func NewClient(cfg *config.ClaudeConfig, logger *service.Logger) *Client {
+	return &Client{
+		config: cfg,
+		logger: logger,
+		httpClient: &http.Client{
+			Timeout: time.Duration(cfg.TimeoutSeconds) * time.Second,
+		},
+		rateLimiter: NewRateLimiter(cfg.MaxRequestsPerHour, time.Hour),
+		sessions:    make(map[string]*ChatSession),
+	}
+}
+
+// NewRateLimiter creates a new rate limiter
+func NewRateLimiter(maxRequests int, window time.Duration) *RateLimiter {
+	return &RateLimiter{
+		requests:    make([]time.Time, 0),
+		maxRequests: maxRequests,
+		window:      window,
+	}
+}
+
+// Allow checks if a request is allowed under rate limiting
+func (r *RateLimiter) Allow() bool {
+	now := time.Now()
+
+	// Remove old requests outside the window
+	cutoff := now.Add(-r.window)
+	validRequests := make([]time.Time, 0)
+	for _, req := range r.requests {
+		if req.After(cutoff) {
+			validRequests = append(validRequests, req)
+		}
+	}
+	r.requests = validRequests
+
+	// Check if we can make another request
+	if len(r.requests) >= r.maxRequests {
+		return false
+	}
+
+	// Add current request
+	r.requests = append(r.requests, now)
+	return true
+}
+
+// SendMessage sends a message to Claude and returns the response
+func (c *Client) SendMessage(ctx context.Context, message string, gameContext *GameContext, sessionID string) (*ChatResponse, error) {
+	if !c.config.Enabled {
+		return nil, fmt.Errorf("claude is disabled in configuration")
+	}
+
+	if !c.rateLimiter.Allow() {
+		c.logger.Info("claude rate limit exceeded, request denied")
+		return &ChatResponse{
+			Error:     "Rate limit exceeded. Please try again later.",
+			Timestamp: time.Now(),
+		}, nil
+	}
+
+	if c.config.APIKey == "" {
+		return &ChatResponse{
+			Error:     "Claude API key not configured",
+			Timestamp: time.Now(),
+		}, nil
+	}
+
+	// Get or create session
+	session := c.getOrCreateSession(sessionID)
+
+	// Build context-aware prompt
+	prompt := c.buildContextualPrompt(message, gameContext)
+
+	// Add user message to session
+	userMsg := AnthropicMessage{
+		Role:    "user",
+		Content: prompt,
+	}
+	session.Messages = append(session.Messages, userMsg)
+
+	// Trim session history if too long
+	c.trimSessionHistory(session)
+
+	// Prepare API request
+	reqBody := AnthropicRequest{
+		Model:     c.config.Model,
+		MaxTokens: maxTokens,
+		Messages:  session.Messages,
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	// Create HTTP request
+	req, err := http.NewRequestWithContext(ctx, "POST", anthropicAPIURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", c.config.APIKey)
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	req.Header.Set("User-Agent", userAgent)
+
+	// Send request
+	c.logger.Info("claude: sending request to API")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("API request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Parse response
+	var apiResp AnthropicResponse
+	err = json.NewDecoder(resp.Body).Decode(&apiResp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	// Check for API errors
+	if apiResp.Error != nil {
+		c.logger.Error("claude API error: %s", apiResp.Error.Message)
+		return &ChatResponse{
+			Error:     fmt.Sprintf("API Error: %s", apiResp.Error.Message),
+			Timestamp: time.Now(),
+		}, nil
+	}
+
+	// Extract content
+	if len(apiResp.Content) == 0 {
+		return &ChatResponse{
+			Error:     "No content in API response",
+			Timestamp: time.Now(),
+		}, nil
+	}
+
+	content := apiResp.Content[0].Text
+	if content == "" {
+		return &ChatResponse{
+			Error:     "Empty response from Claude",
+			Timestamp: time.Now(),
+		}, nil
+	}
+
+	// Add assistant response to session
+	assistantMsg := AnthropicMessage{
+		Role:    "assistant",
+		Content: content,
+	}
+	session.Messages = append(session.Messages, assistantMsg)
+
+	c.logger.Info("claude: response received successfully")
+
+	return &ChatResponse{
+		Content:   content,
+		Timestamp: time.Now(),
+		Context:   gameContext,
+	}, nil
+}
+
+// GenerateSuggestions creates contextual suggestions for the current game
+func (c *Client) GenerateSuggestions(ctx context.Context, gameContext *GameContext) (*SuggestionsResponse, error) {
+	if !c.config.Enabled {
+		return &SuggestionsResponse{
+			Error:     "Claude is disabled",
+			Timestamp: time.Now(),
+		}, nil
+	}
+
+	prompt := c.buildSuggestionsPrompt(gameContext)
+
+	response, err := c.SendMessage(ctx, prompt, gameContext, "suggestions")
+	if err != nil {
+		return &SuggestionsResponse{
+			Error:     "Failed to generate suggestions",
+			Timestamp: time.Now(),
+		}, nil
+	}
+
+	if response.Error != "" {
+		return &SuggestionsResponse{
+			Error:     response.Error,
+			Timestamp: time.Now(),
+		}, nil
+	}
+
+	suggestions := c.parseSuggestions(response.Content)
+
+	return &SuggestionsResponse{
+		Suggestions: suggestions,
+		GameInfo:    gameContext,
+		Generated:   time.Now(),
+	}, nil
+}
+
+// buildContextualPrompt creates a context-aware prompt for Claude
+func (c *Client) buildContextualPrompt(message string, gameContext *GameContext) string {
+	if gameContext == nil || gameContext.GameName == "" {
+		return message
+	}
+
+	if gameContext.SystemName == "Arcade" || strings.Contains(strings.ToLower(gameContext.SystemName), "arcade") {
+		return fmt.Sprintf(`Current game context: %s (%s) - This is an arcade game.
+
+User question: %s
+
+Please provide helpful advice about this specific arcade game. Focus on gameplay tips, strategies, or interesting facts about this game.`,
+			gameContext.GameName, gameContext.SystemName, message)
+	}
+
+	return fmt.Sprintf(`Current game context: %s on %s
+
+User question: %s
+
+Please provide helpful advice about this specific game. Focus on gameplay tips, strategies, or interesting facts.`,
+		gameContext.GameName, gameContext.SystemName, message)
+}
+
+// buildSuggestionsPrompt creates a prompt for generating game suggestions
+func (c *Client) buildSuggestionsPrompt(gameContext *GameContext) string {
+	if gameContext == nil || gameContext.GameName == "" {
+		return "Generate 3 brief gaming tips for retro game enthusiasts."
+	}
+
+	return fmt.Sprintf(`Current game: %s (%s)
+
+Generate exactly 3 brief, helpful suggestions for playing this specific game. Each suggestion should be:
+- One clear sentence
+- Actionable and specific to this game
+- About gameplay strategy, tips, or interesting mechanics
+
+Format as a simple numbered list:
+1. [suggestion]
+2. [suggestion]  
+3. [suggestion]`,
+		gameContext.GameName, gameContext.SystemName)
+}
+
+// parseSuggestions extracts suggestions from Claude's response
+func (c *Client) parseSuggestions(content string) []string {
+	lines := strings.Split(content, "\n")
+	var suggestions []string
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		// Remove list numbering
+		part := strings.TrimPrefix(line, "1. ")
+		part = strings.TrimPrefix(part, "2. ")
+		part = strings.TrimPrefix(part, "3. ")
+
+		part = strings.TrimSpace(part)
+
+		if len(part) >= 20 && len(part) <= 300 {
+			suggestions = append(suggestions, part)
+		}
+
+		if len(suggestions) >= 3 {
+			break
+		}
+	}
+
+	if len(suggestions) > 0 {
+		c.logger.Info("claude: parsed %d suggestions successfully", len(suggestions))
+		return suggestions
+	}
+
+	c.logger.Warn("claude: suggestion parsing failed, using fallback")
+	return []string{
+		"Try exploring different strategies",
+		"Check for hidden mechanics or features",
+		"Practice timing and precision",
+	}
+}
+
+// buildActiveGamePlaylistPrompt creates a prompt for generating playlists based on current game
+func (c *Client) buildActiveGamePlaylistPrompt(request *PlaylistRequest, gameContext *GameContext) string {
+	basePrompt := fmt.Sprintf(`You're helping a retro gaming enthusiast discover new games. They're currently playing "%s" on %s and want recommendations for similar games.
+
+Generate %d game recommendations that share similar qualities with their current game. Focus on:
+- Similar gameplay mechanics or genre
+- Games from the same era or system family  
+- Games with comparable difficulty or style
+
+Theme: %s
+
+Format your response as a simple list of game names, one per line. Only include actual game names that exist.`,
+		gameContext.GameName, gameContext.SystemName, request.GameCount, request.Theme)
+
+	if len(request.Systems) > 0 {
+		basePrompt += fmt.Sprintf("\n\nFocus recommendations on these systems: %s", strings.Join(request.Systems, ", "))
+	}
+
+	return basePrompt
+}
+
+// parseGameRecommendations extracts game names from Claude's playlist response
+func (c *Client) parseGameRecommendations(content string, maxGames int, installedGames []InstalledGame) []GameSuggestion {
+	lines := strings.Split(content, "\n")
+	var games []GameSuggestion
+	installed := make(map[string]bool)
+
+	// Create lookup for installed games
+	for _, game := range installedGames {
+		installed[strings.ToLower(game.Name)] = true
+	}
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Remove list markers
+		line = strings.TrimPrefix(line, "- ")
+		line = strings.TrimPrefix(line, "* ")
+		for i := 1; i <= 20; i++ {
+			line = strings.TrimPrefix(line, fmt.Sprintf("%d. ", i))
+		}
+
+		line = strings.TrimSpace(line)
+
+		if len(line) >= 3 && len(line) <= 100 {
+			isInstalled := installed[strings.ToLower(line)]
+			games = append(games, GameSuggestion{
+				Name:        line,
+				IsInstalled: isInstalled,
+			})
+		}
+
+		if len(games) >= maxGames {
+			break
+		}
+	}
+
+	return games
+}
+
+// getOrCreateSession retrieves or creates a chat session
+func (c *Client) getOrCreateSession(sessionID string) *ChatSession {
+	c.sessionMux.Lock()
+	defer c.sessionMux.Unlock()
+
+	if sessionID == "" {
+		sessionID = "default"
+	}
+
+	session, exists := c.sessions[sessionID]
+	if !exists {
+		session = &ChatSession{
+			Messages: make([]AnthropicMessage, 0),
+			Created:  time.Now(),
+		}
+		c.sessions[sessionID] = session
+	}
+
+	return session
+}
+
+// trimSessionHistory keeps session history within configured limits
+func (c *Client) trimSessionHistory(session *ChatSession) {
+	if len(session.Messages) > c.config.ChatHistory*2 {
+		start := len(session.Messages) - c.config.ChatHistory*2
+		session.Messages = session.Messages[start:]
+	}
+}
+
+// BuildGameContext extracts current game information from tracker
+func (c *Client) BuildGameContext(trk *tracker.Tracker) *GameContext {
+	// ✅ EXTENSIVE DEBUG LOGGING
+	c.logger.Info("claude debug: === BUILDING GAME CONTEXT ===")
+	c.logger.Info("claude debug: ActiveCore = '%s'", trk.ActiveCore)
+	c.logger.Info("claude debug: ActiveGameName = '%s'", trk.ActiveGameName)
+	c.logger.Info("claude debug: ActiveSystemName = '%s'", trk.ActiveSystemName)
+	c.logger.Info("claude debug: ActiveGamePath = '%s'", trk.ActiveGamePath)
+	c.logger.Info("claude debug: ActiveGame = '%s'", trk.ActiveGame)
+
+	context := &GameContext{
+		CoreName:    trk.ActiveCore,
+		GameName:    trk.ActiveGameName,
+		SystemName:  trk.ActiveSystemName,
+		GamePath:    trk.ActiveGamePath,
+		LastStarted: time.Now(),
+	}
+
+	// ✅ PRIORITY 1: Check if SAM is active (with improved detection)
+	if samInfo := c.checkSAMStatus(); samInfo != nil {
+		c.logger.Info("claude debug: SAM detected, using SAM game info")
+		context.GameName = samInfo.GameName
+		context.CoreName = samInfo.CoreName
+		context.SystemName = samInfo.SystemName
+		return context
+	}
+
+	// ✅ PRIORITY 2: Fix arcade detection when SAM is NOT active
+	if context.CoreName != "" {
+		c.logger.Info("claude debug: SAM not active, checking arcade detection for core '%s'", context.CoreName)
+
+		// ✅ IMPROVED: Always check if it's arcade, regardless of what tracker says
+		if arcadeName := c.extractArcadeGameName(context.CoreName); arcadeName != "" {
+			c.logger.Info("claude debug: ✅ ARCADE DETECTED: Core '%s' -> Game '%s'", context.CoreName, arcadeName)
+			context.GameName = arcadeName
+			context.SystemName = "Arcade"
+			context.GamePath = ""
+			return context
+		}
+
+		// ✅ IMPROVED: Fallback for known arcade cores without MRA match
+		if c.isLikelyArcadeCore(context.CoreName) {
+			c.logger.Info("claude debug: ✅ ARCADE FALLBACK: Core '%s' treated as arcade", context.CoreName)
+			context.GameName = context.CoreName
+			context.SystemName = "Arcade"
+			context.GamePath = ""
+			return context
+		}
+
+		c.logger.Info("claude debug: ✅ NON-ARCADE: Core '%s' is not arcade, keeping tracker data", context.CoreName)
+	}
+
+	c.logger.Info("claude debug: === FINAL CONTEXT ===")
+	c.logger.Info("claude debug: Final GameName = '%s'", context.GameName)
+	c.logger.Info("claude debug: Final SystemName = '%s'", context.SystemName)
+	c.logger.Info("claude debug: Final CoreName = '%s'", context.CoreName)
+
+	return context
+}
+
+// ✅ MODIFIED: Main function to use samindex first
 func (c *Client) extractArcadeGameName(coreName string) string {
 	c.logger.Info("claude debug: === EXTRACTING ARCADE NAME ===")
 	c.logger.Info("claude debug: Looking for arcade name for core: '%s'", coreName)
+
+	// 🎯 PRIORITY 1: Use samindex directly (like SAM does)
+	if name := c.extractArcadeGameNameUsingSamindex(coreName); name != "" {
+		c.logger.Info("claude debug: ✅ SUCCESS via samindex: '%s' -> '%s'", coreName, name)
+		return name
+	}
+
+	// 🎯 PRIORITY 2: Fallback to previous method if samindex fails
+	c.logger.Info("claude debug: ⚠️ samindex failed, trying fallback method")
+	if name := c.extractArcadeGameNameFallback(coreName); name != "" {
+		c.logger.Info("claude debug: ✅ SUCCESS via fallback: '%s' -> '%s'", coreName, name)
+		return name
+	}
+
+	// 🎯 PRIORITY 3: Last resort - cleaned core name
+	if c.isLikelyArcadeCore(coreName) {
+		cleaned := c.cleanCoreName(coreName)
+		c.logger.Info("claude debug: ✅ LAST RESORT: Using cleaned core name '%s' -> '%s'", coreName, cleaned)
+		return cleaned
+	}
+
+	c.logger.Info("claude debug: ❌ COMPLETE FAILURE: No arcade name found for core '%s'", coreName)
+	return ""
+}
+
+// ✅ NEW IMPLEMENTATION: Use samindex directly like SAM does
+func (c *Client) extractArcadeGameNameUsingSamindex(coreName string) string {
+	c.logger.Info("claude debug: === USING SAMINDEX DIRECTLY ===")
+	c.logger.Info("claude debug: Looking for arcade game for core: '%s'", coreName)
+
+	// 1. Define paths like SAM does
+	mrsampath := "/media/fat/Scripts/.MiSTer_SAM"
+	samindexBinary := filepath.Join(mrsampath, "samindex")
+	tempGamelistPath := "/tmp"
+	gamelistFile := filepath.Join(tempGamelistPath, "arcade_gamelist.txt")
+
+	// 2. Verify samindex exists
+	if _, err := os.Stat(samindexBinary); err != nil {
+		c.logger.Error("claude debug: ❌ samindex not found at %s: %s", samindexBinary, err)
+		return ""
+	}
+
+	// 3. Execute samindex exactly like SAM: samindex -s arcade -o /tmp
+	c.logger.Info("claude debug: 🔧 Executing: %s -q -s arcade -o %s", samindexBinary, tempGamelistPath)
+	cmd := exec.Command(samindexBinary, "-q", "-s", "arcade", "-o", tempGamelistPath)
+
+	// Execute the command
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		c.logger.Error("claude debug: ❌ samindex execution failed: %s, output: %s", err, string(output))
+		return ""
+	}
+
+	c.logger.Info("claude debug: ✅ samindex executed successfully")
+
+	// 4. Read the generated gamelist file
+	if _, err := os.Stat(gamelistFile); err != nil {
+		c.logger.Error("claude debug: ❌ Gamelist file not found: %s", gamelistFile)
+		return ""
+	}
+
+	content, err := os.ReadFile(gamelistFile)
+	if err != nil {
+		c.logger.Error("claude debug: ❌ Could not read gamelist file: %s", err)
+		return ""
+	}
+
+	c.logger.Info("claude debug: 📄 Reading gamelist with %d bytes", len(content))
+
+	// 5. Search for the core in MRA file paths
+	lines := strings.Split(string(content), "\n")
+	coreNameLower := strings.ToLower(coreName)
+
+	c.logger.Info("claude debug: 🔍 Searching for core '%s' in %d MRA files", coreName, len(lines))
+
+	for i, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		// Log first 5 lines for debugging
+		if i < 5 {
+			c.logger.Info("claude debug: Sample MRA line %d: %s", i+1, line)
+		}
+
+		// Extract filename without extension
+		filename := filepath.Base(line)
+		nameWithoutExt := strings.TrimSuffix(filename, ".mra")
+		nameWithoutExtLower := strings.ToLower(nameWithoutExt)
+
+		// Look for match with core name
+		if strings.Contains(nameWithoutExtLower, coreNameLower) {
+			c.logger.Info("claude debug: 🎯 MATCH FOUND: '%s' matches '%s'", coreName, nameWithoutExt)
+
+			// Try to extract full name from MRA file
+			if fullName := c.extractGameNameFromMRA(line); fullName != "" {
+				c.logger.Info("claude debug: ✅ SUCCESS: Extracted full name from MRA: '%s'", fullName)
+				return fullName
+			}
+
+			// Fallback to filename
+			c.logger.Info("claude debug: ✅ SUCCESS: Using filename: '%s'", nameWithoutExt)
+			return nameWithoutExt
+		}
+	}
+
+	c.logger.Info("claude debug: ❌ No match found for core '%s' in arcade gamelist", coreName)
+	return ""
+}
+
+// ✅ RENAMED: Previous method as fallback
+func (c *Client) extractArcadeGameNameFallback(coreName string) string {
+	c.logger.Info("claude debug: === FALLBACK METHOD ===")
 
 	arcadeDir := "/media/fat/_Arcade"
 
@@ -1457,10 +1530,7 @@ func (c *Client) extractArcadeGameName(coreName string) string {
 	bestScore := 0
 	totalMraFiles := 0
 
-	// ✅ DEBUG: Show first few MRA files we're checking
-	var sampleFiles []string
-
-	// First pass: Find best matching MRA file by filename
+	// Find best match by filename
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -1473,11 +1543,6 @@ func (c *Client) extractArcadeGameName(coreName string) string {
 
 		totalMraFiles++
 
-		// ✅ DEBUG: Collect sample files for logging
-		if len(sampleFiles) < 5 {
-			sampleFiles = append(sampleFiles, filename)
-		}
-
 		nameWithoutExt := strings.TrimSuffix(filename, ".mra")
 		nameWithoutExtLower := strings.ToLower(nameWithoutExt)
 
@@ -1488,59 +1553,350 @@ func (c *Client) extractArcadeGameName(coreName string) string {
 		}
 		baseNameLower := strings.ToLower(baseName)
 
-		// Calculate match score
+		// Calculate score
 		score := c.calculateMatchScore(coreNameLower, baseNameLower, nameWithoutExtLower)
-
-		// ✅ DEBUG: Log interesting matches
-		if score > 30 { // Lower threshold for debugging
-			c.logger.Info("claude debug: Match candidate: '%s' -> '%s' (score: %d)", coreName, baseName, score)
-		}
 
 		if score > bestScore {
 			bestScore = score
 			bestMatch = baseName
 			bestMatchPath = filepath.Join(arcadeDir, filename)
-			c.logger.Info("claude debug: 🎯 NEW BEST MATCH: '%s' -> '%s' (score: %d)", coreName, baseName, score)
 		}
 	}
 
-	c.logger.Info("claude debug: Processed %d .mra files total", totalMraFiles)
-	c.logger.Info("claude debug: Sample MRA files: %v", sampleFiles)
-	c.logger.Info("claude debug: Best match: '%s' with score %d", bestMatch, bestScore)
+	c.logger.Info("claude debug: Processed %d .mra files, best score: %d", totalMraFiles, bestScore)
 
-	// ✅ ALWAYS try to read XML if we found any match at all
 	if bestScore == 0 {
-		c.logger.Info("claude debug: ❌ No suitable match found for core '%s'", coreName)
 		return ""
 	}
 
-	// ✅ Try to get full name from MRA XML content
+	// Try to extract from XML if we have a match
 	if bestMatchPath != "" {
-		c.logger.Info("claude debug: 📄 Reading MRA file: %s", bestMatchPath)
-
 		if xmlName := c.extractGameNameFromMRA(bestMatchPath); xmlName != "" {
-			c.logger.Info("claude debug: ✅ SUCCESS: Using XML name: '%s' (filename was: '%s')", xmlName, bestMatch)
 			return xmlName
-		} else {
-			c.logger.Info("claude debug: ⚠️ XML extraction failed, falling back to filename: '%s'", bestMatch)
 		}
 	}
 
-	// ✅ Lower threshold for accepting filename matches
-	if bestScore >= 50 { // Lowered from 70 to 50
-		c.logger.Info("claude debug: ✅ FILENAME ACCEPTED: '%s' -> '%s' (score: %d)", coreName, bestMatch, bestScore)
+	// Minimum score to accept
+	if bestScore >= 50 {
 		return bestMatch
 	}
 
-	c.logger.Info("claude debug: ❌ MATCH REJECTED: score %d < 50", bestScore)
+	return ""
+}
 
-	// Try fallback
-	if c.isLikelyArcadeCore(coreName) {
-		cleaned := c.cleanCoreName(coreName)
-		c.logger.Info("claude debug: ✅ FALLBACK: Using cleaned core name '%s' -> '%s'", coreName, cleaned)
-		return cleaned
+// ✅ NEW: Function to clean core names
+func (c *Client) cleanCoreName(coreName string) string {
+	// Remove common numbers and special characters
+	cleaned := coreName
+	cleaned = strings.TrimSuffix(cleaned, "h") // ssf2h -> ssf2
+	cleaned = strings.TrimSuffix(cleaned, "t") // ssf2t -> ssf2
+
+	// Convert known abbreviations
+	replacements := map[string]string{
+		"ssf2": "Super Street Fighter II",
+		"sf2":  "Street Fighter II",
+		"mk":   "Mortal Kombat",
+		"kof":  "King of Fighters",
+		"ms":   "Metal Slug",
 	}
 
-	c.logger.Info("claude debug: ❌ NOT ARCADE: Core '%s' doesn't appear to be arcade", coreName)
+	if replacement, exists := replacements[strings.ToLower(cleaned)]; exists {
+		return replacement
+	}
+
+	return cleaned
+}
+
+// calculateMatchScore computes similarity between core and game names
+func (c *Client) calculateMatchScore(coreName, baseName, fullName string) int {
+	score := 0
+
+	if coreName == baseName {
+		return 100
+	}
+
+	if strings.HasPrefix(coreName, baseName) {
+		score += 80
+	}
+
+	if strings.HasPrefix(baseName, coreName) {
+		score += 75
+	}
+
+	if strings.Contains(coreName, baseName) {
+		score += 60
+	}
+
+	if strings.Contains(baseName, coreName) {
+		score += 65
+	}
+
+	if len(coreName) == len(baseName)+1 && strings.HasPrefix(coreName, baseName) {
+		score += 85
+	}
+
+	coreAbbrev := c.removeVowels(coreName)
+	baseAbbrev := c.removeVowels(baseName)
+	if coreAbbrev == baseAbbrev {
+		score += 70
+	}
+
+	if c.similarStrings(coreName, baseName) {
+		score += 50
+	}
+
+	return score
+}
+
+// removeVowels removes vowels from a string for fuzzy matching
+func (c *Client) removeVowels(s string) string {
+	vowels := "aeiou"
+	result := ""
+	for _, char := range strings.ToLower(s) {
+		if !strings.ContainsRune(vowels, char) {
+			result += string(char)
+		}
+	}
+	return result
+}
+
+// similarStrings checks if two strings are similar enough
+func (c *Client) similarStrings(a, b string) bool {
+	if len(a) == 0 || len(b) == 0 {
+		return false
+	}
+
+	lengthDiff := len(a) - len(b)
+	if lengthDiff < 0 {
+		lengthDiff = -lengthDiff
+	}
+
+	if lengthDiff > 2 {
+		return false
+	}
+
+	commonChars := 0
+	shorter := a
+	if len(b) < len(a) {
+		shorter = b
+	}
+
+	for i := 0; i < len(shorter); i++ {
+		if i < len(a) && i < len(b) && a[i] == b[i] {
+			commonChars++
+		}
+	}
+
+	return float64(commonChars)/float64(len(shorter)) > 0.6
+}
+
+// isLikelyArcadeCore determines if a core name suggests an arcade game
+func (c *Client) isLikelyArcadeCore(coreName string) bool {
+	if coreName == "" {
+		return false
+	}
+
+	// Known non-arcade systems
+	nonArcadeSystems := []string{
+		"nes", "snes", "genesis", "megadrive", "n64", "psx", "saturn",
+		"gb", "gbc", "gba", "gg", "sms", "tgfx16", "neogeo",
+		"atari", "c64", "amiga", "ao486", "minimig",
+	}
+
+	coreNameLower := strings.ToLower(coreName)
+	for _, system := range nonArcadeSystems {
+		if strings.Contains(coreNameLower, system) {
+			return false
+		}
+	}
+
+	// If it's a short name without clear system indicators, likely arcade
+	return len(coreName) <= 8 && !strings.Contains(coreName, "/")
+}
+
+// ✅ IMPROVED: Simple SAM detection with age check only
+func (c *Client) checkSAMStatus() *SAMGameInfo {
+	samFile := "/tmp/SAM_Game.txt"
+
+	// Read SAM file
+	data, err := os.ReadFile(samFile)
+	if err != nil {
+		c.logger.Info("claude debug: SAM file not found or error reading: %s", err)
+		return nil
+	}
+
+	samGameText := strings.TrimSpace(string(data))
+	c.logger.Info("claude debug: SAM file content: '%s'", samGameText)
+
+	if samGameText == "" {
+		c.logger.Info("claude debug: SAM file is empty")
+		return nil
+	}
+
+	// ✅ Check if SAM file is too old (obsolete)
+	stat, err := os.Stat(samFile)
+	if err != nil {
+		c.logger.Info("claude debug: Cannot stat SAM file: %s", err)
+		return nil
+	}
+
+	age := time.Since(stat.ModTime())
+	maxAge := 3 * time.Minute // SAM file older than 3 minutes is considered obsolete
+
+	c.logger.Info("claude debug: SAM file age: %v (max allowed: %v)", age, maxAge)
+
+	if age > maxAge {
+		c.logger.Info("claude debug: SAM file is too old (%v) - treating as obsolete", age)
+		return nil
+	}
+
+	samInfo := c.parseSAMGameInfo(samGameText)
+	if samInfo != nil {
+		c.logger.Info("claude debug: SAM parsed successfully - Game: '%s', Core: '%s', System: '%s'",
+			samInfo.GameName, samInfo.CoreName, samInfo.SystemName)
+	} else {
+		c.logger.Info("claude debug: SAM parsing failed for content: '%s'", samGameText)
+	}
+
+	return samInfo
+}
+
+// Enhanced parsing with detailed logging
+func (c *Client) parseSAMGameInfo(samText string) *SAMGameInfo {
+	c.logger.Info("claude debug: === PARSING SAM INFO ===")
+	c.logger.Info("claude debug: Input text: '%s'", samText)
+
+	// Look for last opening parenthesis
+	idx := strings.LastIndex(samText, " (")
+	if idx == -1 {
+		c.logger.Info("claude debug: No opening parenthesis found")
+		return nil
+	}
+
+	gameName := samText[:idx]
+	coreInfo := samText[idx+2:] // Skip " ("
+
+	c.logger.Info("claude debug: Extracted game name: '%s'", gameName)
+	c.logger.Info("claude debug: Core info section: '%s'", coreInfo)
+
+	// Look for closing parenthesis
+	endIdx := strings.Index(coreInfo, ")")
+	if endIdx == -1 {
+		c.logger.Info("claude debug: No closing parenthesis found")
+		return nil
+	}
+
+	coreName := coreInfo[:endIdx]
+	c.logger.Info("claude debug: Extracted core name: '%s'", coreName)
+
+	// Map core to system
+	systemName := c.mapCoreToSystem(coreName)
+	c.logger.Info("claude debug: Mapped system name: '%s'", systemName)
+
+	return &SAMGameInfo{
+		GameName:   gameName,
+		CoreName:   coreName,
+		SystemName: systemName,
+	}
+}
+
+// Enhanced mapping with logging
+func (c *Client) mapCoreToSystem(coreName string) string {
+	systemMap := map[string]string{
+		"atari5200": "Atari 5200",
+		"atari2600": "Atari 2600",
+		"atari7800": "Atari 7800",
+		"nes":       "Nintendo Entertainment System",
+		"snes":      "Super Nintendo",
+		"genesis":   "Sega Genesis",
+		"megacd":    "Sega CD",
+		"s32x":      "Sega 32X",
+		"arcade":    "Arcade",
+		"neogeo":    "SNK NeoGeo",
+		"psx":       "Sony PlayStation",
+		"saturn":    "Sega Saturn",
+		"n64":       "Nintendo 64",
+		"gb":        "Game Boy",
+		"gbc":       "Game Boy Color",
+		"gba":       "Game Boy Advance",
+	}
+
+	if system, exists := systemMap[strings.ToLower(coreName)]; exists {
+		return system
+	}
+
+	// Default to titlecase of core name
+	return strings.Title(coreName)
+}
+
+// ✅ FINAL FIX: Extract game name from MRA XML with correct patterns
+func (c *Client) extractGameNameFromMRA(mraPath string) string {
+	content, err := os.ReadFile(mraPath)
+	if err != nil {
+		c.logger.Error("claude debug: ❌ Could not read MRA file %s: %s", mraPath, err)
+		return ""
+	}
+
+	contentStr := string(content)
+
+	// Show first 200 chars of MRA content for debugging
+	preview := contentStr
+	if len(preview) > 200 {
+		preview = preview[:200] + "..."
+	}
+	c.logger.Info("claude debug: MRA content preview: %s", preview)
+
+	// ✅ CORRECTED: Try all possible XML name patterns
+	// Pattern 1: <name>Game Name</name> (full name tag)
+	nameStart := strings.Index(contentStr, "<name>")
+	if nameStart != -1 {
+		nameStart += 6 // len("<name>")
+		nameEnd := strings.Index(contentStr[nameStart:], "</name>")
+		if nameEnd != -1 {
+			gameName := strings.TrimSpace(contentStr[nameStart : nameStart+nameEnd])
+			if gameName != "" {
+				c.logger.Info("claude debug: ✅ Extracted from <name> tag: '%s'", gameName)
+				return gameName
+			}
+		}
+	}
+
+	// Pattern 2: <n>Game Name</n> (short name tag)
+	nameStart = strings.Index(contentStr, "<n>")
+	if nameStart != -1 {
+		nameStart += 3 // len("<n>")
+		nameEnd := strings.Index(contentStr[nameStart:], "</n>")
+		if nameEnd != -1 {
+			gameName := strings.TrimSpace(contentStr[nameStart : nameStart+nameEnd])
+			if gameName != "" {
+				c.logger.Info("claude debug: ✅ Extracted from <n> tag: '%s'", gameName)
+				return gameName
+			}
+		}
+	}
+
+	// Pattern 3: <setname>Game Name</setname>
+	nameStart = strings.Index(contentStr, "<setname>")
+	if nameStart != -1 {
+		nameStart += 9 // len("<setname>")
+		nameEnd := strings.Index(contentStr[nameStart:], "</setname>")
+		if nameEnd != -1 {
+			gameName := strings.TrimSpace(contentStr[nameStart : nameStart+nameEnd])
+			if gameName != "" {
+				c.logger.Info("claude debug: ✅ Extracted from <setname> tag: '%s'", gameName)
+				return gameName
+			}
+		}
+	}
+
+	c.logger.Info("claude debug: ❌ No name tags found in MRA XML (tried: name, n, setname)")
 	return ""
+}
+
+// Helper function for min (add at the end of the file if it doesn't exist)
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
