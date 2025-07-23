@@ -1097,28 +1097,3 @@ func HandleDebugActiveGame(logger *service.Logger, cfg *config.UserConfig, trk *
 		logger.Info("claude debug: Debug info sent to client")
 	}
 }
-
-// ✅ OPTIONAL: Test endpoint to verify MRA extraction works
-func HandleTestMRA(logger *service.Logger, cfg *config.UserConfig) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		coreName := r.URL.Query().Get("core")
-		if coreName == "" {
-			http.Error(w, "Missing 'core' parameter", http.StatusBadRequest)
-			return
-		}
-
-		client := NewClient(&cfg.Claude, logger)
-
-		// Test extraction
-		extractedName := client.extractArcadeGameName(coreName)
-
-		result := map[string]interface{}{
-			"core_name":      coreName,
-			"extracted_name": extractedName,
-			"timestamp":      time.Now(),
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(result)
-	}
-}

@@ -278,7 +278,6 @@ func setupApi(sub *mux.Router, kbd input.Keyboard, trk *tracker.Tracker, logger 
 	sub.HandleFunc("/claude/cache/clear", claude.HandleClearCache(logger)).Methods("POST")
 	sub.HandleFunc("/api/claude/active-game-suggestion", claude.HandleActiveGameSuggestion(logger, cfg, trk)).Methods("GET")
 	sub.HandleFunc("/claude/debug-active-game", claude.HandleDebugActiveGame(logger, cfg, trk)).Methods("GET")
-	sub.HandleFunc("/claude/test-mra", claude.HandleTestMRA(logger, cfg)).Methods("GET")
 }
 
 func appHandler(rw http.ResponseWriter, req *http.Request) {

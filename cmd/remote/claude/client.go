@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -257,7 +256,7 @@ Provide helpful, relevant advice based on the game context.`,
 		gameContext.GameName, gameContext.SystemName, gameContext.CoreName, message)
 }
 
-// BuildGameContext extracts current game information from tracker
+// buildGameContext extracts current game information from tracker
 func (c *Client) BuildGameContext(trk *tracker.Tracker) *GameContext {
 	// ✅ EXTENSIVE DEBUG LOGGING
 	c.logger.Info("claude debug: === BUILDING GAME CONTEXT ===")
@@ -275,7 +274,7 @@ func (c *Client) BuildGameContext(trk *tracker.Tracker) *GameContext {
 		LastStarted: time.Now(),
 	}
 
-	// ✅ PRIORITY 1: Check if SAM is active (with improved detection)
+	// ✅ NEW LOGIC: Check if SAM is active
 	if samInfo := c.checkSAMStatus(); samInfo != nil {
 		c.logger.Info("claude debug: SAM detected, using SAM game info")
 		context.GameName = samInfo.GameName
@@ -284,29 +283,43 @@ func (c *Client) BuildGameContext(trk *tracker.Tracker) *GameContext {
 		return context
 	}
 
-	// ✅ PRIORITY 2: Fix arcade detection when SAM is NOT active
+	// ✅ CRITICAL: Only override if we don't have good data from tracker
 	if context.CoreName != "" {
-		c.logger.Info("claude debug: SAM not active, checking arcade detection for core '%s'", context.CoreName)
+		c.logger.Info("claude debug: Checking arcade detection for core '%s'", context.CoreName)
 
-		// ✅ IMPROVED: Always check if it's arcade, regardless of what tracker says
-		if arcadeName := c.extractArcadeGameName(context.CoreName); arcadeName != "" {
-			c.logger.Info("claude debug: ✅ ARCADE DETECTED: Core '%s' -> Game '%s'", context.CoreName, arcadeName)
-			context.GameName = arcadeName
+		// If tracker already detected arcade properly, trust it!
+		if context.SystemName == "Arcade" && context.GameName != "" && context.GameName != context.CoreName {
+			c.logger.Info("claude debug: ✅ TRUSTING TRACKER: Arcade game '%s' already detected correctly", context.GameName)
+			// Don't override - tracker has the right info
+			return context
+		}
+
+		// If tracker says it's arcade but no game name, or game name == core name
+		if context.SystemName == "Arcade" && (context.GameName == "" || context.GameName == context.CoreName) {
+			c.logger.Info("claude debug: Tracker detected arcade but no specific game name, trying extraction...")
+			if arcadeName := c.extractArcadeGameName(context.CoreName); arcadeName != "" {
+				context.GameName = arcadeName
+				c.logger.Info("claude debug: ✅ EXTRACTION SUCCESS: '%s' -> '%s'", context.CoreName, arcadeName)
+			} else {
+				c.logger.Warn("claude debug: ❌ EXTRACTION FAILED for core '%s'", context.CoreName)
+				context.GameName = context.CoreName // fallback
+			}
 			context.SystemName = "Arcade"
 			context.GamePath = ""
 			return context
 		}
 
-		// ✅ IMPROVED: Fallback for known arcade cores without MRA match
-		if c.isLikelyArcadeCore(context.CoreName) {
-			c.logger.Info("claude debug: ✅ ARCADE FALLBACK: Core '%s' treated as arcade", context.CoreName)
-			context.GameName = context.CoreName
-			context.SystemName = "Arcade"
-			context.GamePath = ""
-			return context
+		// If tracker doesn't think it's arcade, but maybe it is
+		if context.SystemName != "Arcade" {
+			if arcadeName := c.extractArcadeGameName(context.CoreName); arcadeName != "" {
+				c.logger.Info("claude debug: ✅ OVERRIDE: Detected arcade core '%s' -> '%s' (tracker missed it)", context.CoreName, arcadeName)
+				context.GameName = arcadeName
+				context.SystemName = "Arcade"
+				context.GamePath = ""
+			} else {
+				c.logger.Info("claude debug: ✅ NON-ARCADE: Core '%s' is not arcade, keeping tracker data", context.CoreName)
+			}
 		}
-
-		c.logger.Info("claude debug: ✅ NON-ARCADE: Core '%s' is not arcade, keeping tracker data", context.CoreName)
 	}
 
 	c.logger.Info("claude debug: === FINAL CONTEXT ===")
@@ -317,7 +330,7 @@ func (c *Client) BuildGameContext(trk *tracker.Tracker) *GameContext {
 	return context
 }
 
-// ✅ IMPROVED: Simple SAM detection with age check only
+// Enhanced SAM detection with obsolete file detection
 func (c *Client) checkSAMStatus() *SAMGameInfo {
 	samFile := "/tmp/SAM_Game.txt"
 
@@ -336,20 +349,9 @@ func (c *Client) checkSAMStatus() *SAMGameInfo {
 		return nil
 	}
 
-	// ✅ Check if SAM file is too old (obsolete)
-	stat, err := os.Stat(samFile)
-	if err != nil {
-		c.logger.Info("claude debug: Cannot stat SAM file: %s", err)
-		return nil
-	}
-
-	age := time.Since(stat.ModTime())
-	maxAge := 3 * time.Minute // SAM file older than 3 minutes is considered obsolete
-
-	c.logger.Info("claude debug: SAM file age: %v (max allowed: %v)", age, maxAge)
-
-	if age > maxAge {
-		c.logger.Info("claude debug: SAM file is too old (%v) - treating as obsolete", age)
+	// ✅ NEW: Check if SAM file is obsolete
+	if c.isSAMFileObsolete(samFile) {
+		c.logger.Info("claude debug: SAM file appears to be obsolete - ignoring")
 		return nil
 	}
 
@@ -821,6 +823,82 @@ func (c *Client) parseSuggestions(content string) []string {
 		"Check for hidden mechanics or features",
 		"Practice timing and precision",
 	}
+}
+
+// extractArcadeGameName attempts to match a core name to an arcade game
+func (c *Client) extractArcadeGameName(coreName string) string {
+	c.logger.Info("claude debug: === EXTRACTING ARCADE NAME ===")
+	c.logger.Info("claude debug: Looking for arcade name for core: '%s'", coreName)
+
+	arcadeDir := "/media/fat/_Arcade"
+
+	entries, err := os.ReadDir(arcadeDir)
+	if err != nil {
+		c.logger.Error("claude debug: ❌ Could not read _Arcade directory: %s", err)
+		return ""
+	}
+
+	c.logger.Info("claude debug: Found %d entries in _Arcade directory", len(entries))
+
+	coreNameLower := strings.ToLower(coreName)
+	bestMatch := ""
+	bestScore := 0
+	totalMraFiles := 0
+
+	// Debug: Show first few .mra files
+	mraFiles := make([]string, 0)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		filename := entry.Name()
+		if !strings.HasSuffix(strings.ToLower(filename), ".mra") {
+			continue
+		}
+
+		totalMraFiles++
+		if len(mraFiles) < 10 { // Show first 10 for debugging
+			mraFiles = append(mraFiles, filename)
+		}
+
+		nameWithoutExt := strings.TrimSuffix(filename, ".mra")
+		nameWithoutExtLower := strings.ToLower(nameWithoutExt)
+
+		baseName := nameWithoutExt
+		if idx := strings.Index(nameWithoutExt, "("); idx != -1 {
+			baseName = strings.TrimSpace(nameWithoutExt[:idx])
+		}
+		baseNameLower := strings.ToLower(baseName)
+
+		score := c.calculateMatchScore(coreNameLower, baseNameLower, nameWithoutExtLower)
+
+		if score > bestScore {
+			bestScore = score
+			bestMatch = baseName
+			c.logger.Info("claude debug: New best match: '%s' -> '%s' (score: %d)", coreName, baseName, score)
+		}
+	}
+
+	c.logger.Info("claude debug: Total MRA files: %d", totalMraFiles)
+	c.logger.Info("claude debug: Sample MRA files: %v", mraFiles)
+	c.logger.Info("claude debug: Best match: '%s' with score %d", bestMatch, bestScore)
+
+	if bestScore >= 70 {
+		c.logger.Info("claude debug: ✅ MATCH ACCEPTED: core '%s' -> arcade game '%s' (score: %d)", coreName, bestMatch, bestScore)
+		return bestMatch
+	}
+
+	c.logger.Info("claude debug: ❌ MATCH REJECTED: score %d < 70, trying fallback", bestScore)
+
+	if c.isLikelyArcadeCore(coreName) {
+		cleaned := c.cleanCoreName(coreName)
+		c.logger.Info("claude debug: ✅ FALLBACK: Using cleaned core name '%s' -> '%s'", coreName, cleaned)
+		return cleaned
+	}
+
+	c.logger.Info("claude debug: ❌ NOT ARCADE: Core '%s' doesn't appear to be arcade", coreName)
+	return ""
 }
 
 // calculateMatchScore computes similarity between core and game names
@@ -1370,177 +1448,4 @@ func min(a, b int) int {
 		return a
 	}
 	return b
-}
-
-// ✅ FINAL FIX: Extract game name from MRA XML with correct patterns
-func (c *Client) extractGameNameFromMRA(mraPath string) string {
-	content, err := os.ReadFile(mraPath)
-	if err != nil {
-		c.logger.Error("claude debug: ❌ Could not read MRA file %s: %s", mraPath, err)
-		return ""
-	}
-
-	contentStr := string(content)
-
-	// Show first 200 chars of MRA content for debugging
-	preview := contentStr
-	if len(preview) > 200 {
-		preview = preview[:200] + "..."
-	}
-	c.logger.Info("claude debug: MRA content preview: %s", preview)
-
-	// ✅ CORRECTED: Try all possible XML name patterns
-	// Pattern 1: <name>Game Name</name> (full name tag)
-	nameStart := strings.Index(contentStr, "<name>")
-	if nameStart != -1 {
-		nameStart += 6 // len("<name>")
-		nameEnd := strings.Index(contentStr[nameStart:], "</name>")
-		if nameEnd != -1 {
-			gameName := strings.TrimSpace(contentStr[nameStart : nameStart+nameEnd])
-			if gameName != "" {
-				c.logger.Info("claude debug: ✅ Extracted from <name> tag: '%s'", gameName)
-				return gameName
-			}
-		}
-	}
-
-	// Pattern 2: <n>Game Name</n> (short name tag)
-	nameStart = strings.Index(contentStr, "<n>")
-	if nameStart != -1 {
-		nameStart += 3 // len("<n>")
-		nameEnd := strings.Index(contentStr[nameStart:], "</n>")
-		if nameEnd != -1 {
-			gameName := strings.TrimSpace(contentStr[nameStart : nameStart+nameEnd])
-			if gameName != "" {
-				c.logger.Info("claude debug: ✅ Extracted from <n> tag: '%s'", gameName)
-				return gameName
-			}
-		}
-	}
-
-	// Pattern 3: <setname>Game Name</setname>
-	nameStart = strings.Index(contentStr, "<setname>")
-	if nameStart != -1 {
-		nameStart += 9 // len("<setname>")
-		nameEnd := strings.Index(contentStr[nameStart:], "</setname>")
-		if nameEnd != -1 {
-			gameName := strings.TrimSpace(contentStr[nameStart : nameStart+nameEnd])
-			if gameName != "" {
-				c.logger.Info("claude debug: ✅ Extracted from <setname> tag: '%s'", gameName)
-				return gameName
-			}
-		}
-	}
-
-	c.logger.Info("claude debug: ❌ No name tags found in MRA XML (tried: name, n, setname)")
-	return ""
-}
-
-// ✅ FINAL: Improved extractArcadeGameName with better debug and lower threshold
-func (c *Client) extractArcadeGameName(coreName string) string {
-	c.logger.Info("claude debug: === EXTRACTING ARCADE NAME ===")
-	c.logger.Info("claude debug: Looking for arcade name for core: '%s'", coreName)
-
-	arcadeDir := "/media/fat/_Arcade"
-
-	entries, err := os.ReadDir(arcadeDir)
-	if err != nil {
-		c.logger.Error("claude debug: ❌ Could not read _Arcade directory: %s", err)
-		return ""
-	}
-
-	c.logger.Info("claude debug: Found %d entries in _Arcade directory", len(entries))
-
-	coreNameLower := strings.ToLower(coreName)
-	bestMatch := ""
-	bestMatchPath := ""
-	bestScore := 0
-	totalMraFiles := 0
-
-	// ✅ DEBUG: Show first few MRA files we're checking
-	var sampleFiles []string
-
-	// First pass: Find best matching MRA file by filename
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-
-		filename := entry.Name()
-		if !strings.HasSuffix(strings.ToLower(filename), ".mra") {
-			continue
-		}
-
-		totalMraFiles++
-
-		// ✅ DEBUG: Collect sample files for logging
-		if len(sampleFiles) < 5 {
-			sampleFiles = append(sampleFiles, filename)
-		}
-
-		nameWithoutExt := strings.TrimSuffix(filename, ".mra")
-		nameWithoutExtLower := strings.ToLower(nameWithoutExt)
-
-		// Extract base name (before first parenthesis)
-		baseName := nameWithoutExt
-		if idx := strings.Index(nameWithoutExt, "("); idx != -1 {
-			baseName = strings.TrimSpace(nameWithoutExt[:idx])
-		}
-		baseNameLower := strings.ToLower(baseName)
-
-		// Calculate match score
-		score := c.calculateMatchScore(coreNameLower, baseNameLower, nameWithoutExtLower)
-
-		// ✅ DEBUG: Log interesting matches
-		if score > 30 { // Lower threshold for debugging
-			c.logger.Info("claude debug: Match candidate: '%s' -> '%s' (score: %d)", coreName, baseName, score)
-		}
-
-		if score > bestScore {
-			bestScore = score
-			bestMatch = baseName
-			bestMatchPath = filepath.Join(arcadeDir, filename)
-			c.logger.Info("claude debug: 🎯 NEW BEST MATCH: '%s' -> '%s' (score: %d)", coreName, baseName, score)
-		}
-	}
-
-	c.logger.Info("claude debug: Processed %d .mra files total", totalMraFiles)
-	c.logger.Info("claude debug: Sample MRA files: %v", sampleFiles)
-	c.logger.Info("claude debug: Best match: '%s' with score %d", bestMatch, bestScore)
-
-	// ✅ ALWAYS try to read XML if we found any match at all
-	if bestScore == 0 {
-		c.logger.Info("claude debug: ❌ No suitable match found for core '%s'", coreName)
-		return ""
-	}
-
-	// ✅ Try to get full name from MRA XML content
-	if bestMatchPath != "" {
-		c.logger.Info("claude debug: 📄 Reading MRA file: %s", bestMatchPath)
-
-		if xmlName := c.extractGameNameFromMRA(bestMatchPath); xmlName != "" {
-			c.logger.Info("claude debug: ✅ SUCCESS: Using XML name: '%s' (filename was: '%s')", xmlName, bestMatch)
-			return xmlName
-		} else {
-			c.logger.Info("claude debug: ⚠️ XML extraction failed, falling back to filename: '%s'", bestMatch)
-		}
-	}
-
-	// ✅ Lower threshold for accepting filename matches
-	if bestScore >= 50 { // Lowered from 70 to 50
-		c.logger.Info("claude debug: ✅ FILENAME ACCEPTED: '%s' -> '%s' (score: %d)", coreName, bestMatch, bestScore)
-		return bestMatch
-	}
-
-	c.logger.Info("claude debug: ❌ MATCH REJECTED: score %d < 50", bestScore)
-
-	// Try fallback
-	if c.isLikelyArcadeCore(coreName) {
-		cleaned := c.cleanCoreName(coreName)
-		c.logger.Info("claude debug: ✅ FALLBACK: Using cleaned core name '%s' -> '%s'", coreName, cleaned)
-		return cleaned
-	}
-
-	c.logger.Info("claude debug: ❌ NOT ARCADE: Core '%s' doesn't appear to be arcade", coreName)
-	return ""
 }
