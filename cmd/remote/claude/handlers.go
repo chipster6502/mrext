@@ -271,28 +271,171 @@ func HandlePlaylist(logger *service.Logger, cfg *config.UserConfig, trk *tracker
 	}
 }
 
-// ✅ FAST: Get installed games with aggressive timeout and smart caching
+// ✅ FAST: Get installed games with aggressive timeout (FIXED - Anti Alphabetical Bias)
 func getInstalledGamesFast(cfg *config.UserConfig, logger *service.Logger, systems []string, timeout time.Duration) ([]InstalledGame, error) {
-	// Default to popular systems if none specified
-	if len(systems) == 0 {
-		systems = []string{"NES", "SNES", "Genesis", "GBA", "SMS"} // Fast defaults
-		logger.Info("claude playlist: using default popular systems: %v", systems)
-	}
+	start := time.Now()
+	deadline := start.Add(timeout)
 
-	// Check cache first
+	// Use cached games if available and recent
 	gameCache.mutex.RLock()
-	cachedGames := filterGamesBySystem(gameCache.Games, systems)
-	cacheAge := time.Since(gameCache.LastUpdated)
-	validCache := len(cachedGames) > 0 && cacheAge < cacheTTL
+	if len(gameCache.Games) > 0 && time.Since(gameCache.LastUpdated) < 30*time.Second {
+		games := make([]InstalledGame, len(gameCache.Games))
+		copy(games, gameCache.Games)
+		gameCache.mutex.RUnlock()
+		logger.Info("claude playlist: using cached games (%d games)", len(games))
+
+		// ✅ CRITICAL: Even cached games need randomization to prevent session bias
+		return randomizeGames(games), nil
+	}
 	gameCache.mutex.RUnlock()
 
-	if validCache {
-		logger.Info("claude playlist: using cached games (%d games, age: %v)", len(cachedGames), cacheAge)
-		return cachedGames, nil
+	// Scan for new games
+	gameCache.mutex.Lock()
+	defer gameCache.mutex.Unlock()
+
+	targetSystems := make([]games.System, 0)
+	if len(systems) == 0 {
+		targetSystems = games.AllSystems()
+	} else {
+		for _, sysName := range systems {
+			if sys, err := games.LookupSystem(sysName); err == nil {
+				targetSystems = append(targetSystems, *sys)
+			}
+		}
 	}
 
-	// Build cache with timeout
-	return buildGameCacheFast(cfg, logger, systems, timeout)
+	logger.Info("claude playlist: scanning %d systems with %v timeout", len(targetSystems), timeout)
+
+	systemPaths := games.GetSystemPaths(cfg, targetSystems)
+	var installedGames []InstalledGame
+
+	// Group paths by system
+	systemPathsMap := make(map[string][]string)
+	for _, p := range systemPaths {
+		systemPathsMap[p.System.Id] = append(systemPathsMap[p.System.Id], p.Path)
+	}
+
+	// Scan with strict timeout per system
+	maxGamesPerSystem := 100 // Aggressive limit
+	systemTimeout := timeout / time.Duration(len(systemPathsMap))
+	if systemTimeout < 1*time.Second {
+		systemTimeout = 1 * time.Second
+	}
+
+	for systemId, paths := range systemPathsMap {
+		if time.Now().After(deadline) {
+			logger.Warn("claude playlist: global timeout reached, stopping scan")
+			break
+		}
+
+		systemStart := time.Now()
+		systemDeadline := systemStart.Add(systemTimeout)
+
+		system, err := games.LookupSystem(systemId)
+		if err != nil {
+			continue
+		}
+
+		systemGameCount := 0
+
+		for _, path := range paths {
+			if time.Now().After(systemDeadline) {
+				logger.Debug("claude playlist: system timeout for %s", systemId)
+				break
+			}
+
+			files, err := games.GetFiles(systemId, path)
+			if err != nil {
+				logger.Debug("failed to scan %s: %s", path, err)
+				continue
+			}
+
+			// ✅ CRITICAL FIX: Randomize files immediately after GetFiles() to break filesystem alphabetical order
+			files = randomizeFileList(files)
+
+			// Process files with limit
+			for _, file := range files {
+				if systemGameCount >= maxGamesPerSystem || time.Now().After(systemDeadline) {
+					break
+				}
+
+				gameName := extractGameName(file)
+				installedGames = append(installedGames, InstalledGame{
+					Name:   gameName,
+					Path:   file,
+					System: system.Name,
+				})
+				systemGameCount++
+			}
+
+			if systemGameCount >= maxGamesPerSystem {
+				break
+			}
+		}
+
+		systemTime := time.Since(systemStart)
+		logger.Info("claude playlist: scanned %s: %d games in %v", systemId, systemGameCount, systemTime)
+	}
+
+	// ✅ SECOND RANDOMIZATION: Randomize the entire collection before caching
+	installedGames = randomizeGames(installedGames)
+
+	// Update cache
+	gameCache.Games = installedGames
+	gameCache.LastUpdated = time.Now()
+
+	elapsed := time.Since(start)
+	logger.Info("claude playlist: fast scan completed: %d games from %d systems in %v",
+		len(installedGames), len(systemPathsMap), elapsed)
+
+	return installedGames, nil
+}
+
+// ✅ NEW: Randomize file list to break filesystem alphabetical ordering
+func randomizeFileList(files []string) []string {
+	if len(files) <= 1 {
+		return files
+	}
+
+	randomized := make([]string, len(files))
+	copy(randomized, files)
+
+	// Use time-based seed to ensure different randomization each call
+	baseTime := time.Now().UnixNano()
+	for i := len(randomized) - 1; i > 0; i-- {
+		// Create pseudo-random but deterministic-ish index
+		seed := baseTime + int64(i*1000) + int64(len(randomized)*100)
+		j := int(seed) % (i + 1)
+		if j < 0 {
+			j = -j
+		}
+		randomized[i], randomized[j] = randomized[j], randomized[i]
+	}
+
+	return randomized
+}
+
+// ✅ NEW: Randomize InstalledGame slice to break any remaining bias
+func randomizeGames(games []InstalledGame) []InstalledGame {
+	if len(games) <= 1 {
+		return games
+	}
+
+	randomized := make([]InstalledGame, len(games))
+	copy(randomized, games)
+
+	// Use time-based seed with different offset than file randomization
+	baseTime := time.Now().UnixNano() + 9999 // Different seed than file randomization
+	for i := len(randomized) - 1; i > 0; i-- {
+		seed := baseTime + int64(i*2000) + int64(len(randomized)*200)
+		j := int(seed) % (i + 1)
+		if j < 0 {
+			j = -j
+		}
+		randomized[i], randomized[j] = randomized[j], randomized[i]
+	}
+
+	return randomized
 }
 
 // ✅ FAST: Build game cache with strict timeout

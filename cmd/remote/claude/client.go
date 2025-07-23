@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math/rand"
 	"net/http"
 	"os"
 	"strings"
@@ -315,99 +314,6 @@ func (c *Client) buildGameContext(trk *tracker.Tracker) *GameContext {
 	return context
 }
 
-// ✅ IMPROVED: buildPlaylistPrompt with better system balance instructions
-func (c *Client) buildPlaylistPrompt(request *PlaylistRequest) string {
-	if len(request.InstalledGames) == 0 {
-		// Fallback to generic recommendations if no games provided
-		return c.buildPlaylistPromptGeneric(request)
-	}
-
-	// Build list of user's actual games for Claude
-	var gamesList strings.Builder
-	gamesList.WriteString("AVAILABLE GAMES IN USER'S COLLECTION:\n\n")
-
-	// Group games by system for better organization and balance analysis
-	systemGames := make(map[string][]InstalledGame)
-	for _, game := range request.InstalledGames {
-		systemGames[game.System] = append(systemGames[game.System], game)
-	}
-
-	// ✅ NEW: Calculate target games per system for balanced distribution
-	targetPerSystem := ""
-	if len(request.Systems) > 1 && request.GameCount > len(request.Systems) {
-		minPerSystem := request.GameCount / len(request.Systems)
-		remainder := request.GameCount % len(request.Systems)
-
-		if minPerSystem > 0 {
-			targetPerSystem = fmt.Sprintf("\nTARGET DISTRIBUTION: Aim for %d-%d games per system to ensure balanced variety.",
-				minPerSystem, minPerSystem+1)
-			if remainder > 0 {
-				targetPerSystem += fmt.Sprintf(" (%d systems can have +1 extra game)", remainder)
-			}
-		}
-	}
-
-	// Seed random number generator for game shuffling
-	rand.Seed(time.Now().UnixNano())
-
-	for system, games := range systemGames {
-		gamesList.WriteString(fmt.Sprintf("%s (%d games available):\n", system, len(games)))
-
-		// ✅ SIMPLE FIX: Reverse order + time-based rotation
-		orderedGames := make([]InstalledGame, len(games))
-		copy(orderedGames, games)
-
-		// Reverse the list to start with Z instead of A
-		for i, j := 0, len(orderedGames)-1; i < j; i, j = i+1, j-1 {
-			orderedGames[i], orderedGames[j] = orderedGames[j], orderedGames[i]
-		}
-
-		// Add time-based rotation to vary the starting point
-		offset := int(time.Now().Second()) % len(orderedGames)
-		rotatedGames := make([]InstalledGame, len(orderedGames))
-		for i, game := range orderedGames {
-			newIndex := (i + offset) % len(orderedGames)
-			rotatedGames[newIndex] = game
-		}
-
-		for _, game := range rotatedGames {
-			gamesList.WriteString(fmt.Sprintf("- %s\n", game.Name))
-		}
-		gamesList.WriteString("\n")
-	}
-
-	prompt := fmt.Sprintf(`You are generating a curated game playlist for a MiSTer FPGA user.
-
-THEME: %s
-REQUESTED COUNT: %d games
-SELECTED SYSTEMS: %v%s
-
-%s
-
-CRITICAL INSTRUCTIONS:
-- You MUST only recommend games from the user's collection listed above
-- Do NOT recommend games that are not in the list
-- Select games that best match the theme "%s"
-- BALANCE REQUIREMENT: When multiple systems are selected, provide good variety across ALL selected systems
-- Avoid recommending all games from just one or two systems
-- Focus on quality and theme relevance while maintaining system balance
-- If a system has fewer games available, that's acceptable, but try to include at least 1-2 games from each system when possible
-
-FORMAT REQUIREMENTS:
-Format each recommendation exactly as:
-Game Name | System | Brief description | Why it fits the theme
-
-Only recommend games that appear exactly in the user's collection above.`,
-		request.Theme,
-		request.GameCount,
-		request.Systems,
-		targetPerSystem,
-		gamesList.String(),
-		request.Theme)
-
-	return prompt
-}
-
 // buildPlaylistPromptGeneric provides fallback for when no games are provided
 func (c *Client) buildPlaylistPromptGeneric(request *PlaylistRequest) string {
 	prompt := fmt.Sprintf("Generate exactly %d game recommendations for the theme: %s\n",
@@ -421,16 +327,44 @@ func (c *Client) buildPlaylistPromptGeneric(request *PlaylistRequest) string {
 		prompt += fmt.Sprintf("User preferences: %s\n", request.Preferences)
 	}
 
-	prompt += "Format each game as: Game Name | System | Brief description | Why recommended"
+	prompt += `
+RANDOMIZATION REQUIREMENT:
+- Do NOT list games in alphabetical order
+- ACTIVELY AVOID alphabetical patterns (A, B, C games)
+- Mix different starting letters randomly in your recommendations
+- Prioritize theme relevance over alphabetical ordering
+- Ensure variety in the first letters of recommended games (avoid clustering around A-D)
+
+Format each game as: Game Name | System | Brief description | Why recommended`
 	return prompt
 }
 
-// ✅ IMPROVED: parseGameRecommendations with balance verification
+// ✅ IMPROVED: parseGameRecommendations with anti-bias fuzzy matching
 func (c *Client) parseGameRecommendations(content string, count int, installedGames []InstalledGame) []GameRecommendation {
+	c.logger.Info("=== CLAUDE'S RAW RESPONSE ===")
+	c.logger.Info("Response length: %d characters", len(content))
+	c.logger.Info("Full response: %s", content)
+	c.logger.Info("==============================")
 	recommendations := make([]GameRecommendation, 0, count)
 
 	// Create fast lookup map of installed games
 	installedMap := make(map[string]InstalledGame)
+	// ✅ CRITICAL: Also create a randomized slice for unbiased fuzzy matching
+	gamesList := make([]InstalledGame, len(installedGames))
+	copy(gamesList, installedGames)
+
+	// Randomize the games list for fuzzy matching to prevent alphabetical bias
+	baseTime := time.Now().UnixNano() + 7777 // Different seed
+	for i := len(gamesList) - 1; i > 0; i-- {
+		seed := baseTime + int64(i*3000) + int64(len(gamesList)*300)
+		j := int(seed) % (i + 1)
+		if j < 0 {
+			j = -j
+		}
+		gamesList[i], gamesList[j] = gamesList[j], gamesList[i]
+	}
+
+	// Build the lookup map
 	for _, game := range installedGames {
 		// Normalize name for search
 		key := strings.ToLower(strings.TrimSpace(game.Name))
@@ -492,8 +426,9 @@ func (c *Client) parseGameRecommendations(content string, count int, installedGa
 			installedGame, gameFound = installedMap[normalizedName]
 
 			if !gameFound {
-				// Try fuzzy matching for slight variations
-				for installedName, installed := range installedMap {
+				// ✅ FIXED: Use randomized slice instead of map iteration to prevent bias
+				for _, installed := range gamesList {
+					installedName := strings.ToLower(strings.TrimSpace(installed.Name))
 					if strings.Contains(installedName, normalizedName) ||
 						strings.Contains(normalizedName, installedName) {
 						installedGame = installed
@@ -506,50 +441,47 @@ func (c *Client) parseGameRecommendations(content string, count int, installedGa
 					continue
 				}
 			}
+
+			// Use actual game path from collection
+			if gameFound {
+				name = installedGame.Name     // Use exact name from collection
+				system = installedGame.System // Use exact system name
+			}
+		} else {
+			// No validation possible, use Claude's data as-is
+			installedGame = InstalledGame{
+				Name:   name,
+				System: system,
+			}
 		}
 
-		// Clean up "Recommended for" prefix if present
-		if strings.HasPrefix(strings.ToLower(reason), "recommended for ") {
-			reason = reason[16:]
-		}
-
-		// Create recommendation
-		rec := GameRecommendation{
+		recommendation := GameRecommendation{
 			Name:        name,
 			System:      system,
+			Path:        installedGame.Path,
 			Description: description,
 			Reason:      reason,
+			GeneratedAt: time.Now(),
 		}
 
-		// ✅ NEW: Use actual path from installed games if available
-		if gameFound {
-			rec.Path = installedGame.Path
-		}
+		recommendations = append(recommendations, recommendation)
 
-		recommendations = append(recommendations, rec)
-
+		// Stop if we have enough recommendations
 		if len(recommendations) >= count {
 			break
 		}
 	}
 
-	// ✅ NEW: Apply balance verification if we have target systems
-	if len(recommendations) > 0 {
-		// Extract unique systems from parsed recommendations
-		systemSet := make(map[string]bool)
-		for _, rec := range recommendations {
-			systemSet[rec.System] = true
-		}
-
-		targetSystems := make([]string, 0, len(systemSet))
-		for system := range systemSet {
-			targetSystems = append(targetSystems, system)
-		}
-
-		recommendations = c.verifySystemBalance(recommendations, targetSystems, count)
+	// ✅ BALANCE CHECK: If multiple systems were requested, try to balance recommendations
+	if len(recommendations) > 1 {
+		recommendations = c.verifySystemBalance(recommendations, []string{}, count)
 	}
+	c.logger.Info("=== FINAL PARSED RECOMMENDATIONS ===")
+	for i, rec := range recommendations {
+		c.logger.Info("  %d: %s (%s)", i+1, rec.Name, rec.System)
+	}
+	c.logger.Info("=====================================")
 
-	c.logger.Info("claude playlist: parsed %d game recommendations", len(recommendations))
 	return recommendations
 }
 
@@ -1064,7 +996,25 @@ func (c *Client) buildActiveGamePlaylistPrompt(request *PlaylistRequest, gameCon
 
 	for system, games := range systemGames {
 		gamesList.WriteString(fmt.Sprintf("%s (%d games available):\n", system, len(games)))
-		for _, game := range games {
+
+		// ✅ SAME FIX: Apply the same randomization as in buildPlaylistPrompt
+		orderedGames := make([]InstalledGame, len(games))
+		copy(orderedGames, games)
+
+		// Reverse the list to start with Z instead of A
+		for i, j := 0, len(orderedGames)-1; i < j; i, j = i+1, j-1 {
+			orderedGames[i], orderedGames[j] = orderedGames[j], orderedGames[i]
+		}
+
+		// Add time-based rotation to vary the starting point
+		offset := int(time.Now().Second()) % len(orderedGames)
+		rotatedGames := make([]InstalledGame, len(orderedGames))
+		for i, game := range orderedGames {
+			newIndex := (i + offset) % len(orderedGames)
+			rotatedGames[newIndex] = game
+		}
+
+		for _, game := range rotatedGames {
 			gamesList.WriteString(fmt.Sprintf("- %s\n", game.Name))
 		}
 		gamesList.WriteString("\n")
@@ -1102,6 +1052,14 @@ CRITICAL REQUIREMENTS:
 - If multiple systems are selected, provide variety across systems when possible
 - Prioritize quality matches over quantity
 
+RANDOMIZATION REQUIREMENT:
+- Do NOT list games in alphabetical order
+- ACTIVELY AVOID alphabetical patterns (A, B, C games)  
+- Mix different starting letters randomly in your recommendations
+- Prioritize similarity to "%s" over alphabetical ordering
+- If you notice alphabetical bias, deliberately break it by choosing games that start with different letters
+- Ensure variety in the first letters of recommended games (avoid clustering around A-D)
+
 FORMAT REQUIREMENTS:
 Format each recommendation exactly as:
 Game Name | System | Brief description | Why it's similar to %s
@@ -1114,6 +1072,7 @@ Only recommend games that appear exactly in the user's collection above.`,
 		gamesList.String(),
 		gameContext.GameName,
 		themeContext,
+		gameContext.GameName,
 		gameContext.GameName,
 		gameContext.GameName)
 
@@ -1135,8 +1094,15 @@ Look for games that share:
 - Similar difficulty or complexity
 - Related themes or settings
 
+RANDOMIZATION REQUIREMENT:
+- Do NOT list games in alphabetical order
+- ACTIVELY AVOID alphabetical patterns (A, B, C games)
+- Mix different starting letters randomly in your recommendations
+- Prioritize similarity to "%s" over alphabetical ordering
+- Ensure variety in the first letters of recommended games (avoid clustering around A-D)
+
 `,
-		request.GameCount, gameContext.GameName, gameContext.SystemName, themeContext)
+		request.GameCount, gameContext.GameName, gameContext.SystemName, themeContext, gameContext.GameName)
 
 	if len(request.Systems) > 0 {
 		prompt += fmt.Sprintf("Focus on these systems: %v\n", request.Systems)
@@ -1150,30 +1116,6 @@ Look for games that share:
 	return prompt
 }
 
-// isActiveGameThemeKeyword checks if the theme indicates active game-based playlist
-func isActiveGameThemeKeyword(theme string) bool {
-	theme = strings.ToLower(strings.TrimSpace(theme))
-	keywords := []string{
-		"active game",
-		"current game",
-		"similar to active",
-		"similar to current",
-		"based on active",
-		"based on current",
-		"like current game",
-		"like active game",
-		"playlist based in active game", // User's specific example
-		"playlist based on active game",
-	}
-
-	for _, keyword := range keywords {
-		if strings.Contains(theme, keyword) {
-			return true
-		}
-	}
-	return false
-}
-
 // GetActiveGameSuggestion returns a dynamic suggestion based on the current active game
 func (c *Client) GetActiveGameSuggestion(trk *tracker.Tracker) string {
 	gameContext := c.buildGameContext(trk)
@@ -1182,4 +1124,127 @@ func (c *Client) GetActiveGameSuggestion(trk *tracker.Tracker) string {
 	}
 
 	return fmt.Sprintf("Games similar to %s", gameContext.GameName)
+}
+
+func (c *Client) buildPlaylistPrompt(request *PlaylistRequest) string {
+	if len(request.InstalledGames) == 0 {
+		// Fallback to generic recommendations if no games provided
+		return c.buildPlaylistPromptGeneric(request)
+	}
+
+	// ✅ QUICK DEBUG: Log the raw games we're sending to Claude
+	c.logger.Info("=== CLAUDE INPUT DEBUG ===")
+	c.logger.Info("Theme: %s", request.Theme)
+	c.logger.Info("Games being sent to Claude (first 15):")
+	for i := 0; i < 15 && i < len(request.InstalledGames); i++ {
+		game := request.InstalledGames[i]
+		c.logger.Info("  %d: %s (%s)", i+1, game.Name, game.System)
+	}
+	c.logger.Info("==========================")
+
+	// Build list of user's actual games for Claude
+	var gamesList strings.Builder
+	gamesList.WriteString("AVAILABLE GAMES IN USER'S COLLECTION:\n\n")
+
+	// Group games by system for better organization and balance analysis
+	systemGames := make(map[string][]InstalledGame)
+	for _, game := range request.InstalledGames {
+		systemGames[game.System] = append(systemGames[game.System], game)
+	}
+
+	// ✅ NEW: Calculate target games per system for balanced distribution
+	targetPerSystem := ""
+	if len(request.Systems) > 1 && request.GameCount > len(request.Systems) {
+		minPerSystem := request.GameCount / len(request.Systems)
+		remainder := request.GameCount % len(request.Systems)
+
+		if minPerSystem > 0 {
+			targetPerSystem = fmt.Sprintf("\nTARGET DISTRIBUTION: Aim for %d-%d games per system to ensure balanced variety.",
+				minPerSystem, minPerSystem+1)
+			if remainder > 0 {
+				targetPerSystem += fmt.Sprintf(" (%d systems can have +1 extra game)", remainder)
+			}
+		}
+	}
+
+	// ✅ SIMPLE FIX: Reverse order + time-based rotation
+	for system, games := range systemGames {
+		gamesList.WriteString(fmt.Sprintf("%s (%d games available):\n", system, len(games)))
+
+		// ✅ SIMPLE FIX: Reverse order + time-based rotation
+		orderedGames := make([]InstalledGame, len(games))
+		copy(orderedGames, games)
+
+		// Reverse the list to start with Z instead of A
+		for i, j := 0, len(orderedGames)-1; i < j; i, j = i+1, j-1 {
+			orderedGames[i], orderedGames[j] = orderedGames[j], orderedGames[i]
+		}
+
+		// Add time-based rotation to vary the starting point
+		offset := int(time.Now().Second()) % len(orderedGames)
+		rotatedGames := make([]InstalledGame, len(orderedGames))
+		for i, game := range orderedGames {
+			newIndex := (i + offset) % len(orderedGames)
+			rotatedGames[newIndex] = game
+		}
+
+		for _, game := range rotatedGames {
+			gamesList.WriteString(fmt.Sprintf("- %s\n", game.Name))
+		}
+		gamesList.WriteString("\n")
+	}
+
+	prompt := fmt.Sprintf(`You are generating a curated game playlist for a MiSTer FPGA user.
+
+THEME: %s
+REQUESTED COUNT: %d games
+SELECTED SYSTEMS: %v%s
+
+%s
+
+CRITICAL INSTRUCTIONS:
+- You MUST only recommend games from the user's collection listed above
+- Do NOT recommend games that are not in the list
+- Select games that best match the theme "%s"
+- BALANCE REQUIREMENT: When multiple systems are selected, provide good variety across ALL selected systems
+- Avoid recommending all games from just one or two systems
+- Focus on quality and theme relevance while maintaining system balance
+- If a system has fewer games available, that's acceptable, but try to include at least 1-2 games from each system when possible
+
+EXTREMELY IMPORTANT - ALPHABETICAL DIVERSITY REQUIREMENT:
+- Do NOT list games in alphabetical order under ANY circumstances
+- ACTIVELY AVOID recommending multiple games that start with the same letter
+- Mix different starting letters randomly in your recommendations
+- Prioritize theme relevance over alphabetical ordering
+- If you notice your recommendations start with similar letters (like A, B, C), STOP and choose games that start with different letters instead
+- Ensure variety in the first letters of recommended games (avoid clustering around A-D)
+- This is CRITICAL - users have complained about alphabetical bias in recommendations
+
+FORMAT REQUIREMENTS:
+Format each recommendation exactly as:
+Game Name | System | Brief description | Why it fits the theme
+
+Only recommend games that appear exactly in the user's collection above.`,
+		request.Theme,
+		request.GameCount,
+		request.Systems,
+		targetPerSystem,
+		gamesList.String(),
+		request.Theme)
+
+	// ✅ QUICK DEBUG: Log the actual prompt sent to Claude
+	c.logger.Info("=== PROMPT SENT TO CLAUDE ===")
+	c.logger.Info("Full prompt length: %d characters", len(prompt))
+	c.logger.Info("Prompt preview (first 500 chars): %s", prompt[:min(len(prompt), 500)])
+	c.logger.Info("==============================")
+
+	return prompt
+}
+
+// Helper function for min (add at the end of the file if it doesn't exist)
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

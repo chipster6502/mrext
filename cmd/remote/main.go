@@ -276,7 +276,7 @@ func setupApi(sub *mux.Router, kbd input.Keyboard, trk *tracker.Tracker, logger 
 	sub.HandleFunc("/claude/config", claude.HandleUpdateConfig(logger, cfg)).Methods("PUT")
 	sub.HandleFunc("/claude/export", claude.HandleExportPlaylist(logger)).Methods("POST")
 	sub.HandleFunc("/claude/cache/clear", claude.HandleClearCache(logger)).Methods("POST")
-	router.HandleFunc("/api/claude/active-game-suggestion", claude.HandleActiveGameSuggestion(logger, cfg, trk)).Methods("GET")
+	sub.HandleFunc("/api/claude/active-game-suggestion", claude.HandleActiveGameSuggestion(logger, cfg, trk)).Methods("GET")
 	sub.HandleFunc("/claude/debug-active-game", claude.HandleDebugActiveGame(logger, cfg, trk)).Methods("GET")
 }
 
