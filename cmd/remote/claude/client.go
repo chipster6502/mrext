@@ -22,6 +22,12 @@ const (
 	userAgent       = "MiSTer-Remote-Claude/1.0"
 )
 
+// SAMGameInfo holds parsed information from SAM's game file
+type SAMGameInfo struct {
+	GameName   string
+	CoreName   string
+	SystemName string
+}
 type Client struct {
 	config      *config.ClaudeConfig
 	logger      *service.Logger
@@ -267,6 +273,15 @@ func (c *Client) buildGameContext(trk *tracker.Tracker) *GameContext {
 		LastStarted: time.Now(),
 	}
 
+	// ✅ NEW LOGIC: Check if SAM is active
+	if samInfo := c.checkSAMStatus(); samInfo != nil {
+		c.logger.Info("claude debug: SAM detected, using SAM game info")
+		context.GameName = samInfo.GameName
+		context.CoreName = samInfo.CoreName
+		context.SystemName = samInfo.SystemName
+		return context
+	}
+
 	// ✅ CRITICAL: Only override if we don't have good data from tracker
 	if context.CoreName != "" {
 		c.logger.Info("claude debug: Checking arcade detection for core '%s'", context.CoreName)
@@ -312,6 +327,128 @@ func (c *Client) buildGameContext(trk *tracker.Tracker) *GameContext {
 	c.logger.Info("claude debug: Final CoreName = '%s'", context.CoreName)
 
 	return context
+}
+
+// Enhanced SAM detection with detailed logging
+func (c *Client) checkSAMStatus() *SAMGameInfo {
+	samFile := "/tmp/SAM_Game.txt"
+
+	// Read SAM file
+	data, err := os.ReadFile(samFile)
+	if err != nil {
+		c.logger.Info("claude debug: SAM file not found or error reading: %s", err)
+		return nil
+	}
+
+	samGameText := strings.TrimSpace(string(data))
+	c.logger.Info("claude debug: SAM file content: '%s'", samGameText)
+
+	if samGameText == "" {
+		c.logger.Info("claude debug: SAM file is empty")
+		return nil
+	}
+
+	samInfo := c.parseSAMGameInfo(samGameText)
+	if samInfo != nil {
+		c.logger.Info("claude debug: SAM parsed successfully - Game: '%s', Core: '%s', System: '%s'",
+			samInfo.GameName, samInfo.CoreName, samInfo.SystemName)
+	} else {
+		c.logger.Info("claude debug: SAM parsing failed for content: '%s'", samGameText)
+	}
+
+	return samInfo
+}
+
+// Enhanced parsing with detailed logging
+func (c *Client) parseSAMGameInfo(samText string) *SAMGameInfo {
+	c.logger.Info("claude debug: === PARSING SAM INFO ===")
+	c.logger.Info("claude debug: Input text: '%s'", samText)
+
+	// Look for last opening parenthesis
+	idx := strings.LastIndex(samText, " (")
+	if idx == -1 {
+		c.logger.Info("claude debug: No opening parenthesis found")
+		return nil
+	}
+
+	gameName := samText[:idx]
+	coreInfo := samText[idx+2:] // Skip " ("
+
+	c.logger.Info("claude debug: Extracted game name: '%s'", gameName)
+	c.logger.Info("claude debug: Core info section: '%s'", coreInfo)
+
+	// Look for closing parenthesis
+	endIdx := strings.Index(coreInfo, ")")
+	if endIdx == -1 {
+		c.logger.Info("claude debug: No closing parenthesis found")
+		return nil
+	}
+
+	coreName := coreInfo[:endIdx]
+	c.logger.Info("claude debug: Extracted core name: '%s'", coreName)
+
+	// Map core to system
+	systemName := c.mapCoreToSystem(coreName)
+	c.logger.Info("claude debug: Mapped system name: '%s'", systemName)
+
+	return &SAMGameInfo{
+		GameName:   gameName,
+		CoreName:   coreName,
+		SystemName: systemName,
+	}
+}
+
+// Enhanced mapping with logging
+func (c *Client) mapCoreToSystem(coreName string) string {
+	systemMap := map[string]string{
+		"atari5200": "Atari 5200",
+		"atari2600": "Atari 2600",
+		"atari7800": "Atari 7800",
+		"nes":       "Nintendo Entertainment System",
+		"snes":      "Super Nintendo",
+		"genesis":   "Sega Genesis",
+		"megacd":    "Sega CD",
+		"s32x":      "Sega 32X",
+		"arcade":    "Arcade",
+		"neogeo":    "Neo Geo",
+		"cps1":      "Capcom CPS-1",
+		"cps2":      "Capcom CPS-2",
+		"gb":        "Game Boy",
+		"gbc":       "Game Boy Color",
+		"gba":       "Game Boy Advance",
+		"psx":       "PlayStation",
+		"saturn":    "Sega Saturn",
+		"n64":       "Nintendo 64",
+		"tgfx16":    "TurboGrafx-16",
+		"tgfx16cd":  "TurboGrafx-CD",
+		"ao486":     "PC (486)",
+		"amiga":     "Commodore Amiga",
+		"c64":       "Commodore 64",
+	}
+
+	if systemName, exists := systemMap[coreName]; exists {
+		c.logger.Info("claude debug: Core '%s' mapped to system '%s'", coreName, systemName)
+		return systemName
+	}
+
+	c.logger.Info("claude debug: Core '%s' not found in map, using as-is", coreName)
+	return coreName // Fallback to core name
+}
+
+func HandleDebugSAM(logger *service.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		samData, _ := os.ReadFile("/tmp/SAM_Game.txt")
+		activeData, _ := os.ReadFile("/tmp/ACTIVEGAME")
+
+		debug := map[string]interface{}{
+			"sam_game":    strings.TrimSpace(string(samData)),
+			"active_game": strings.TrimSpace(string(activeData)),
+			"sam_active":  len(samData) > 0,
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(debug)
+	}
 }
 
 // buildPlaylistPromptGeneric provides fallback for when no games are provided
