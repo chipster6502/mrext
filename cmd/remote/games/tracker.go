@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
+	claude "github.com/wizzomafizzo/mrext/cmd/remote/claude"
 	"github.com/wizzomafizzo/mrext/cmd/remote/websocket"
 	"github.com/wizzomafizzo/mrext/pkg/config"
 	"github.com/wizzomafizzo/mrext/pkg/mister"
@@ -107,14 +108,28 @@ type PlayingPayload struct {
 	GameName   string `json:"gameName"`
 }
 
-func HandlePlaying(tr *tracker.Tracker) http.HandlerFunc {
+func HandlePlaying(tr *tracker.Tracker, cfg *config.UserConfig, logger *service.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Create Claude client to use SAM detection logic
+		client := claude.NewClient(&cfg.Claude, logger)
+		gameContext := client.BuildGameContext(tr)
+
+		// Determine if SAM is active by checking if game info differs significantly
+		samActive := gameContext.GameName != tr.ActiveGameName ||
+			(gameContext.GameName != "" && tr.ActiveGameName == "")
+
+		gamePath := gameContext.GamePath
+		if samActive {
+			// When SAM is active, we don't have the real path
+			gamePath = "" // or use a placeholder like "SAM_ACTIVE"
+		}
+
 		playing := PlayingPayload{
-			Core:       tr.ActiveCore,
-			System:     tr.ActiveSystem,
-			SystemName: tr.ActiveSystemName,
-			Game:       tr.ActiveGame,
-			GameName:   tr.ActiveGameName,
+			Core:       gameContext.CoreName,
+			System:     gameContext.SystemName,
+			SystemName: gameContext.SystemName,
+			Game:       gamePath, // ✅ Empty when SAM active
+			GameName:   gameContext.GameName,
 		}
 
 		err := json.NewEncoder(w).Encode(playing)
