@@ -355,7 +355,10 @@ func (tr *Tracker) LoadCore() {
 			tr.ActiveSystemName = result.Name
 
 			if result.System == ArcadeSystem {
-				mister.SetActiveGame(coreName)
+				// mister.SetActiveGame(coreName)
+				tr.Logger.Info("tracker debug: Arcade core detected: %s", coreName)
+				tr.Logger.Info("tracker debug: Current ActiveGamePath: %s", tr.ActiveGamePath)
+
 				tr.ActiveGame = coreName
 				tr.ActiveGameName = result.ArcadeName
 				tr.addEvent(EventActionGameStart, coreName)

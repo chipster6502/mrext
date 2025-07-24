@@ -138,6 +138,9 @@ func LaunchGame(cfg *config.UserConfig, system games.System, path string) error 
 		if err != nil {
 			return err
 		}
+		if ActiveGameEnabled() {
+			SetActiveGame(path)
+		}
 	case ".mgl":
 		err := launchFile(path)
 		if err != nil {
@@ -340,6 +343,7 @@ func LaunchGenericFile(cfg *config.UserConfig, path string) error {
 		if err != nil {
 			return err
 		}
+		isGame = true // ✅ CHANGE: .mra files ARE games
 	case ".mgl":
 		err = launchFile(path)
 		if err != nil {
@@ -351,6 +355,7 @@ func LaunchGenericFile(cfg *config.UserConfig, path string) error {
 		if err != nil {
 			return err
 		}
+		// isGame remains false for .rbf files
 	default:
 		system, err := games.BestSystemMatch(cfg, path)
 		if err != nil {

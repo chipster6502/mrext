@@ -1097,3 +1097,44 @@ func HandleDebugActiveGame(logger *service.Logger, cfg *config.UserConfig, trk *
 		logger.Info("claude debug: Debug info sent to client")
 	}
 }
+
+// HandleGetGameContext returns the current game context processed by Claude
+func HandleGetGameContext(logger *service.Logger, cfg *config.UserConfig, trk *tracker.Tracker) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Only allow GET requests
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Create Claude client
+		client := NewClient(&cfg.Claude, logger)
+
+		// Build game context with Claude processing
+		gameContext := client.buildGameContext(trk)
+
+		// Prepare response with clean data
+		response := map[string]interface{}{
+			"core_name":    gameContext.CoreName,
+			"game_name":    gameContext.GameName,
+			"system_name":  gameContext.SystemName,
+			"game_path":    gameContext.GamePath,
+			"last_started": gameContext.LastStarted,
+			"timestamp":    time.Now(),
+		}
+
+		// Set response headers
+		w.Header().Set("Content-Type", "application/json")
+
+		// Encode and send response
+		err := json.NewEncoder(w).Encode(response)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			logger.Error("claude game context: failed to encode response: %s", err)
+			return
+		}
+
+		logger.Info("claude game context: returned context for '%s' (%s)",
+			gameContext.GameName, gameContext.SystemName)
+	}
+}

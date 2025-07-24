@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -251,13 +253,38 @@ Provide helpful, relevant advice based on the game context.`,
 
 // buildGameContext extracts current game information from tracker
 func (c *Client) buildGameContext(trk *tracker.Tracker) *GameContext {
-	// ✅ EXTENSIVE DEBUG LOGGING
 	c.logger.Info("claude debug: === BUILDING GAME CONTEXT ===")
 	c.logger.Info("claude debug: ActiveCore = '%s'", trk.ActiveCore)
 	c.logger.Info("claude debug: ActiveGameName = '%s'", trk.ActiveGameName)
 	c.logger.Info("claude debug: ActiveSystemName = '%s'", trk.ActiveSystemName)
 	c.logger.Info("claude debug: ActiveGamePath = '%s'", trk.ActiveGamePath)
-	c.logger.Info("claude debug: ActiveGame = '%s'", trk.ActiveGame)
+
+	// ✅ ENHANCED: Extra debugging to understand the problem
+	c.logger.Info("claude debug: === DETAILED TRACKER STATE ===")
+	c.logger.Info("claude debug: GamePath length = %d", len(trk.ActiveGamePath))
+	c.logger.Info("claude debug: GamePath == 'None'? %v", trk.ActiveGamePath == "None")
+	c.logger.Info("claude debug: GamePath == ''? %v", trk.ActiveGamePath == "")
+	if trk.ActiveGamePath != "" && trk.ActiveGamePath != "None" {
+		c.logger.Info("claude debug: 🎯 SHOULD USE FILE METHOD")
+		ext := strings.ToLower(filepath.Ext(trk.ActiveGamePath))
+		c.logger.Info("claude debug: File extension check: '%s'", ext)
+		c.logger.Info("claude debug: Is .mra? %v", strings.HasSuffix(strings.ToLower(trk.ActiveGamePath), ".mra"))
+
+		// ✅ ENHANCED: Check if path looks like a core name instead of file path
+		baseName := filepath.Base(trk.ActiveGamePath)
+		hasSlash := strings.Contains(trk.ActiveGamePath, "/")
+		hasExtension := ext != ""
+		c.logger.Info("claude debug: Path analysis - hasSlash: %v, hasExtension: %v, baseName: '%s'",
+			hasSlash, hasExtension, baseName)
+
+		if !hasExtension && len(baseName) < 10 {
+			c.logger.Warn("claude debug: ⚠️ GamePath looks like core name, not file path!")
+		}
+	} else {
+		c.logger.Info("claude debug: ⚠️ WILL USE FALLBACK METHOD")
+		c.logger.Info("claude debug: Why fallback? GamePath='%s'", trk.ActiveGamePath)
+	}
+	c.logger.Info("claude debug: ===========================")
 
 	context := &GameContext{
 		CoreName:    trk.ActiveCore,
@@ -267,41 +294,63 @@ func (c *Client) buildGameContext(trk *tracker.Tracker) *GameContext {
 		LastStarted: time.Now(),
 	}
 
-	// ✅ CRITICAL: Only override if we don't have good data from tracker
-	if context.CoreName != "" {
-		c.logger.Info("claude debug: Checking arcade detection for core '%s'", context.CoreName)
+	// ✅ ENHANCED: Process game if we have a valid game path
+	if context.GamePath != "" && context.GamePath != "None" {
+		// ✅ CHECK: Is this actually a file path or just a core name?
+		ext := strings.ToLower(filepath.Ext(context.GamePath))
+		hasExtension := ext != ""
+		baseName := filepath.Base(context.GamePath)
 
-		// If tracker already detected arcade properly, trust it!
-		if context.SystemName == "Arcade" && context.GameName != "" && context.GameName != context.CoreName {
-			c.logger.Info("claude debug: ✅ TRUSTING TRACKER: Arcade game '%s' already detected correctly", context.GameName)
-			// Don't override - tracker has the right info
-			return context
-		}
+		if hasExtension {
+			// ✅ VALID FILE PATH: Extract clean game name from file path
+			c.logger.Info("claude debug: 🎯 EXECUTING FILE METHOD (valid file path)")
 
-		// If tracker says it's arcade but no game name, or game name == core name
-		if context.SystemName == "Arcade" && (context.GameName == "" || context.GameName == context.CoreName) {
-			c.logger.Info("claude debug: Tracker detected arcade but no specific game name, trying extraction...")
-			if arcadeName := c.extractArcadeGameName(context.CoreName); arcadeName != "" {
-				context.GameName = arcadeName
-				c.logger.Info("claude debug: ✅ EXTRACTION SUCCESS: '%s' -> '%s'", context.CoreName, arcadeName)
-			} else {
-				c.logger.Warn("claude debug: ❌ EXTRACTION FAILED for core '%s'", context.CoreName)
-				context.GameName = context.CoreName // fallback
+			cleanName := c.extractCleanGameName(context.GamePath)
+			if cleanName != "" {
+				context.GameName = cleanName
+				c.logger.Info("claude debug: ✅ EXTRACTED GAME NAME: '%s'", cleanName)
 			}
-			context.SystemName = "Arcade"
-			context.GamePath = ""
-			return context
-		}
 
-		// If tracker doesn't think it's arcade, but maybe it is
-		if context.SystemName != "Arcade" {
-			if arcadeName := c.extractArcadeGameName(context.CoreName); arcadeName != "" {
-				c.logger.Info("claude debug: ✅ OVERRIDE: Detected arcade core '%s' -> '%s' (tracker missed it)", context.CoreName, arcadeName)
-				context.GameName = arcadeName
+			// Detect if this is arcade based on file extension
+			if strings.HasSuffix(strings.ToLower(context.GamePath), ".mra") {
 				context.SystemName = "Arcade"
-				context.GamePath = ""
+				c.logger.Info("claude debug: ✅ DETECTED ARCADE from .mra file")
 			} else {
-				c.logger.Info("claude debug: ✅ NON-ARCADE: Core '%s' is not arcade, keeping tracker data", context.CoreName)
+				// For non-arcade games, infer system from path
+				inferredSystem := c.inferSystemFromPath(context.GamePath, context.CoreName)
+				if inferredSystem != "" {
+					context.SystemName = inferredSystem
+					c.logger.Info("claude debug: ✅ INFERRED SYSTEM: '%s'", inferredSystem)
+				}
+			}
+		} else {
+			// ⚠️ PATH WITHOUT EXTENSION: Likely a core name, treat as fallback
+			c.logger.Warn("claude debug: ⚠️ GamePath has no extension, treating as core name: '%s'", context.GamePath)
+
+			if c.isLikelyArcadeCore(baseName) {
+				context.SystemName = "Arcade"
+				context.GameName = c.cleanArcadeCoreName(baseName)
+				c.logger.Info("claude debug: ⚠️ CORE NAME ARCADE: '%s' -> '%s'", baseName, context.GameName)
+			}
+		}
+	} else if context.CoreName != "" {
+		// Fallback: only core name available (shouldn't happen with the fix)
+		c.logger.Warn("claude debug: ⚠️ EXECUTING FALLBACK METHOD")
+		c.logger.Warn("claude debug: ⚠️ GamePath is empty/None: '%s'", context.GamePath)
+
+		if c.isLikelyArcadeCore(context.CoreName) {
+			context.SystemName = "Arcade"
+			context.GameName = c.cleanArcadeCoreName(context.CoreName)
+			c.logger.Info("claude debug: ⚠️ FALLBACK ARCADE: '%s' -> '%s'", context.CoreName, context.GameName)
+		} else {
+			c.logger.Warn("claude debug: ⚠️ FALLBACK NON-ARCADE: '%s' not detected as arcade", context.CoreName)
+			// Use names.txt for system enhancement
+			if enhanced := c.getEnhancedSystemName(context.CoreName); enhanced != "" {
+				context.SystemName = enhanced
+				c.logger.Info("claude debug: ⚠️ ENHANCED SYSTEM: '%s'", enhanced)
+			} else {
+				context.SystemName = context.CoreName
+				c.logger.Warn("claude debug: ⚠️ SYSTEM = CORE: '%s'", context.CoreName)
 			}
 		}
 	}
@@ -310,6 +359,7 @@ func (c *Client) buildGameContext(trk *tracker.Tracker) *GameContext {
 	c.logger.Info("claude debug: Final GameName = '%s'", context.GameName)
 	c.logger.Info("claude debug: Final SystemName = '%s'", context.SystemName)
 	c.logger.Info("claude debug: Final CoreName = '%s'", context.CoreName)
+	c.logger.Info("claude debug: Final GamePath = '%s'", context.GamePath)
 
 	return context
 }
@@ -785,6 +835,9 @@ func (c *Client) similarStrings(a, b string) bool {
 
 // isLikelyArcadeCore determines if a core name likely represents an arcade game
 func (c *Client) isLikelyArcadeCore(coreName string) bool {
+	c.logger.Info("claude debug: === ARCADE DETECTION ===")
+	c.logger.Info("claude debug: Testing core name: '%s'", coreName)
+
 	knownSystems := []string{
 		// CONSOLES
 		"AdventureVision", "Arcadia", "Astrocade", "Atari2600", "Atari5200", "Atari7800",
@@ -812,27 +865,83 @@ func (c *Client) isLikelyArcadeCore(coreName string) bool {
 		"TGFX16", "PCE", "GG", "GameGear", "N64", "A7800", "LYNX", "NGP", "WS",
 	}
 
+	// Check if it's a known system (should return false)
 	for _, system := range knownSystems {
 		if strings.EqualFold(coreName, system) {
+			c.logger.Info("claude debug: ❌ KNOWN SYSTEM: '%s' matches '%s'", coreName, system)
 			return false
 		}
 	}
+	c.logger.Info("claude debug: ✅ NOT A KNOWN SYSTEM")
 
-	// Typical arcade patterns
+	// ✅ ENHANCED: More comprehensive arcade patterns
 	arcadePatterns := []string{
-		"194", "195", "196", "197", "198", "199",
-		"pac", "kong", "man", "fighter", "force", "strike",
+		// Game years
+		"194", "195", "196", "197", "198", "199", "200", "201",
+		// Common arcade game elements
+		"pac", "kong", "man", "fighter", "force", "strike", "gun", "combat", "war", "battle",
+		"hero", "ninja", "dragon", "tiger", "fire", "storm", "thunder", "lightning",
+		"street", "world", "super", "mega", "ultra", "hyper", "final", "alpha", "turbo",
+		// Street Fighter variants
+		"sf", "ssf", "sf2", "ssf2", "xsf", "vsf", "msh", "mvc", "mvsc",
+		// Mortal Kombat variants
+		"mk", "umk", "mk2", "mk3",
+		// King of Fighters
+		"kof", "kof94", "kof95", "kof96", "kof97", "kof98", "kof99",
+		// Other popular arcade franchises
+		"tekken", "fatal", "samurai", "geese", "terry", "ryu", "chun", "blanka",
+		"galaga", "centipede", "asteroids", "defender", "joust", "robotron", "qbert",
+		"frogger", "dig", "bubble", "puzzle", "tetris", "columns",
+		// Capcom specific
+		"cps", "cps2", "cps3", "capcom", "darkstalkers", "vampire",
+		// SNK specific
+		"snk", "neo", "fatal", "samurai", "shodown",
+		// Sega specific
+		"virtua", "vf", "vt", "tekken", "soul",
+		// Numbers that appear in arcade game names
+		"1943", "1944", "1942", "19xx",
 	}
 
 	coreNameLower := strings.ToLower(coreName)
+	c.logger.Info("claude debug: Core name lowercase: '%s'", coreNameLower)
+
 	for _, pattern := range arcadePatterns {
 		if strings.Contains(coreNameLower, pattern) {
+			c.logger.Info("claude debug: ✅ ARCADE PATTERN MATCH: '%s' contains '%s'", coreNameLower, pattern)
 			return true
 		}
 	}
+	c.logger.Info("claude debug: ❌ NO ARCADE PATTERNS MATCHED")
 
-	// Only if the name is very short AND not in known systems
-	return len(coreName) <= 8
+	// ✅ ENHANCED: Check for specific arcade core naming patterns
+	// Many arcade cores are short abbreviations
+	shortName := len(coreName) <= 8
+	c.logger.Info("claude debug: Short name check (<=8 chars): %v (length: %d)", shortName, len(coreName))
+
+	// Additional pattern check: cores with numbers and letters mixed (common in arcade)
+	hasNumbers := false
+	hasLetters := false
+	for _, char := range coreName {
+		if char >= '0' && char <= '9' {
+			hasNumbers = true
+		} else if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') {
+			hasLetters = true
+		}
+	}
+	mixedPattern := hasNumbers && hasLetters
+	c.logger.Info("claude debug: Mixed letters/numbers pattern: %v (hasNumbers: %v, hasLetters: %v)",
+		mixedPattern, hasNumbers, hasLetters)
+
+	if shortName && mixedPattern {
+		c.logger.Info("claude debug: ✅ SHORT+MIXED: Likely arcade core")
+		return true
+	} else if shortName {
+		c.logger.Info("claude debug: ✅ SHORT NAME: Detected as arcade")
+		return true
+	}
+
+	c.logger.Info("claude debug: ❌ FINAL RESULT: Not arcade")
+	return false
 }
 
 // cleanCoreName cleans up a core name for display
@@ -1247,4 +1356,260 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// extractCleanGameName extracts clean name from ANY file path (arcade or not)
+func (c *Client) extractCleanGameName(filePath string) string {
+	if filePath == "" || filePath == "None" {
+		return ""
+	}
+
+	fileName := filepath.Base(filePath)
+	name := strings.TrimSuffix(fileName, filepath.Ext(fileName))
+
+	// Remove numeric prefixes like "003 "
+	re := regexp.MustCompile(`^\d+\s+`)
+	name = re.ReplaceAllString(name, "")
+
+	// Remove common suffixes (works for .mra, .nes, .md, etc.)
+	suffixPatterns := []string{
+		`\s*\([^)]*\)`,        // (USA), (Midway), (1980), etc.
+		`\s*\[[^\]]*\]`,       // [!], [Set 1], etc.
+		`\s*\{[^}]*\}`,        // {hack}, etc.
+		`\s*-\s*Set\s*\d+.*$`, // - Set 1, - Set 2, etc.
+		`\s*\bv?\d+\.\d+.*$`,  // version numbers
+		`\s*\brev\s*\d+.*$`,   // revision numbers
+		`\s*\bbeta.*$`,        // beta versions
+		`\s*\bproto.*$`,       // prototype versions
+	}
+
+	for _, pattern := range suffixPatterns {
+		re := regexp.MustCompile(`(?i)` + pattern)
+		name = re.ReplaceAllString(name, "")
+	}
+
+	// Clean up extra spaces
+	name = strings.TrimSpace(name)
+	re = regexp.MustCompile(`\s+`)
+	name = re.ReplaceAllString(name, " ")
+
+	return name
+}
+
+// inferSystemFromPath tries to determine system from file path
+func (c *Client) inferSystemFromPath(gamePath, coreName string) string {
+	// Extract system from path like "/media/fat/games/NES/game.nes"
+	pathParts := strings.Split(gamePath, "/")
+	for i, part := range pathParts {
+		// Look for system folder after "games" or "_Arcade"
+		if (part == "games" || part == "_Arcade") && i+1 < len(pathParts) {
+			candidate := pathParts[i+1]
+			if len(candidate) > 1 && !strings.Contains(candidate, ".") {
+				return candidate
+			}
+		}
+		// Also check if any part looks like a system name
+		if len(part) > 1 && !strings.Contains(part, ".") && part != "media" && part != "fat" && part != "games" {
+			// This might be a system folder name
+			if c.looksLikeSystemName(part) {
+				return part
+			}
+		}
+	}
+
+	// Fallback to core name
+	return coreName
+}
+
+// looksLikeSystemName checks if a string looks like a system name
+func (c *Client) looksLikeSystemName(name string) bool {
+	knownSystems := []string{
+		"NES", "SNES", "Genesis", "MegaDrive", "N64", "Nintendo64", "GBA", "Gameboy",
+		"GameboyColor", "PSX", "Saturn", "Arcade", "AtariLynx", "TurboGrafx16", "TGFX16",
+		"Amstrad", "Amiga", "C64", "MSX", "ZXSpectrum", "AtariST", "PC88",
+	}
+
+	nameLower := strings.ToLower(name)
+	for _, system := range knownSystems {
+		if strings.EqualFold(name, system) || strings.Contains(nameLower, strings.ToLower(system)) {
+			return true
+		}
+	}
+	return false
+}
+
+// getEnhancedSystemName gets enhanced name from names.txt for systems
+func (c *Client) getEnhancedSystemName(coreName string) string {
+	// TODO: Implement names.txt reading (similar to Remote's GetNamesTxt)
+	// For now, return empty string
+	return ""
+}
+
+// cleanArcadeCoreName provides fallback cleaning for core names (rarely used now)
+func (c *Client) cleanArcadeCoreName(coreName string) string {
+	c.logger.Info("claude debug: === CLEANING ARCADE CORE NAME ===")
+	c.logger.Info("claude debug: Input core name: '%s'", coreName)
+
+	name := coreName
+
+	// ✅ ENHANCED: Handle common arcade game abbreviations and variants
+	abbreviations := map[string]string{
+		// Street Fighter series
+		"sf":    "Street Fighter",
+		"sf1":   "Street Fighter",
+		"sf2":   "Street Fighter II",
+		"sf2ce": "Street Fighter II Champion Edition",
+		"sf2hf": "Street Fighter II Hyper Fighting",
+		"sf2t":  "Street Fighter II Turbo",
+		"ssf":   "Super Street Fighter",
+		"ssf2":  "Super Street Fighter II",
+		"ssf2t": "Super Street Fighter II Turbo",
+		"ssf2x": "Super Street Fighter II X",
+		"ssf2h": "Super Street Fighter II Hyper",
+		"xsf":   "X-Men vs Street Fighter",
+		"msh":   "Marvel Super Heroes",
+		"mshu":  "Marvel Super Heroes vs Street Fighter",
+		"mvc":   "Marvel vs Capcom",
+		"mvc2":  "Marvel vs Capcom 2",
+		"mvsc":  "Marvel vs Capcom",
+
+		// Mortal Kombat series
+		"mk":   "Mortal Kombat",
+		"mk2":  "Mortal Kombat II",
+		"mk3":  "Mortal Kombat 3",
+		"umk3": "Ultimate Mortal Kombat 3",
+		"mkr":  "Mortal Kombat Revision",
+
+		// King of Fighters series
+		"kof":     "King of Fighters",
+		"kof94":   "King of Fighters '94",
+		"kof95":   "King of Fighters '95",
+		"kof96":   "King of Fighters '96",
+		"kof97":   "King of Fighters '97",
+		"kof98":   "King of Fighters '98",
+		"kof99":   "King of Fighters '99",
+		"kof2000": "King of Fighters 2000",
+		"kof2001": "King of Fighters 2001",
+		"kof2002": "King of Fighters 2002",
+		"kof2003": "King of Fighters 2003",
+
+		// Classic arcade games
+		"dkong":     "Donkey Kong",
+		"dkongjr":   "Donkey Kong Jr",
+		"pacman":    "Pac-Man",
+		"mspacman":  "Ms. Pac-Man",
+		"galaga":    "Galaga",
+		"galaxian":  "Galaxian",
+		"frogger":   "Frogger",
+		"centipede": "Centipede",
+		"millipede": "Millipede",
+		"asteroids": "Asteroids",
+		"defender":  "Defender",
+		"joust":     "Joust",
+		"robotron":  "Robotron 2084",
+		"qbert":     "Q*bert",
+		"popeye":    "Popeye",
+		"digdug":    "Dig Dug",
+		"xevious":   "Xevious",
+		"zaxxon":    "Zaxxon",
+
+		// Fighting games
+		"fatfury":      "Fatal Fury",
+		"garou":        "Garou Mark of the Wolves",
+		"lastblade":    "Last Blade",
+		"samsh":        "Samurai Shodown",
+		"samsho":       "Samurai Shodown",
+		"darkstalkers": "Darkstalkers",
+		"vampire":      "Vampire",
+		"tekken":       "Tekken",
+		"soulcalibur":  "Soul Calibur",
+
+		// Shoot 'em ups
+		"1942":       "1942",
+		"1943":       "1943",
+		"1944":       "1944",
+		"1943kai":    "1943 Kai",
+		"gradius":    "Gradius",
+		"nemesis":    "Nemesis",
+		"salamander": "Salamander",
+		"rtype":      "R-Type",
+		"darius":     "Darius",
+		"rayforce":   "RayForce",
+		"raystorm":   "RayStorm",
+
+		// Beat 'em ups
+		"finalfight":   "Final Fight",
+		"coa":          "Captain America and the Avengers",
+		"avengers":     "Avengers",
+		"xmen":         "X-Men",
+		"simpsons":     "The Simpsons",
+		"tmnt":         "Teenage Mutant Ninja Turtles",
+		"dd":           "Double Dragon",
+		"doubledragon": "Double Dragon",
+		"streets":      "Streets of Rage",
+
+		// Puzzle games
+		"puyopuyo": "Puyo Puyo",
+		"tetris":   "Tetris",
+		"columns":  "Columns",
+		"puzzle":   "Puzzle",
+		"magical":  "Magical Drop",
+
+		// Platform games
+		"mario":     "Mario Bros",
+		"gbubble":   "Bubble Bobble",
+		"snowbros":  "Snow Bros",
+		"joe":       "Joe & Mac",
+		"wonderboy": "Wonder Boy",
+
+		// Racing games
+		"outrun":       "Out Run",
+		"polepos":      "Pole Position",
+		"roadfighter":  "Road Fighter",
+		"roadblasters": "Road Blasters",
+
+		// Sports games
+		"punchout": "Punch-Out!!",
+		"boxing":   "Boxing",
+		"tennis":   "Tennis",
+		"golf":     "Golf",
+		"baseball": "Baseball",
+		"football": "Football",
+	}
+
+	lowerName := strings.ToLower(name)
+	if expansion, exists := abbreviations[lowerName]; exists {
+		c.logger.Info("claude debug: ✅ ABBREVIATION MATCH: '%s' -> '%s'", lowerName, expansion)
+		return expansion
+	}
+	c.logger.Info("claude debug: ❌ NO ABBREVIATION MATCH FOUND")
+
+	// ✅ ENHANCED: Try partial matches for complex core names
+	for abbrev, expansion := range abbreviations {
+		if strings.Contains(lowerName, abbrev) {
+			c.logger.Info("claude debug: ✅ PARTIAL MATCH: '%s' contains '%s' -> '%s'", lowerName, abbrev, expansion)
+			return expansion
+		}
+	}
+	c.logger.Info("claude debug: ❌ NO PARTIAL MATCHES FOUND")
+
+	// ✅ ENHANCED: Handle number patterns (like 1943kai -> 1943 Kai)
+	re := regexp.MustCompile(`^(\d+)([a-zA-Z]+)$`)
+	if matches := re.FindStringSubmatch(name); len(matches) == 3 {
+		number := matches[1]
+		suffix := matches[2]
+		cleaned := fmt.Sprintf("%s %s", number, strings.Title(suffix))
+		c.logger.Info("claude debug: ✅ NUMBER PATTERN: '%s' -> '%s'", name, cleaned)
+		return cleaned
+	}
+
+	// Basic capitalization as fallback
+	if name != "" {
+		cleaned := strings.Title(strings.ToLower(name))
+		c.logger.Info("claude debug: ✅ BASIC TITLE CASE: '%s' -> '%s'", name, cleaned)
+		return cleaned
+	}
+
+	c.logger.Info("claude debug: ❌ FALLBACK: returning original name '%s'", name)
+	return name
 }
