@@ -90,7 +90,6 @@ type Tracker struct {
 	CoreTimes        map[string]CoreTime
 	GameTimes        map[string]GameTime
 	NameMap          []NameMapping
-	SAMWatcher       *SAMWatcher
 }
 
 func generateNameMap(logger *service.Logger) []NameMapping {

@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -1063,6 +1061,43 @@ func HandleActiveGameSuggestion(logger *service.Logger, cfg *config.UserConfig, 
 	}
 }
 
+// HandleDebugActiveGame provides debugging info for active game detection
+func HandleDebugActiveGame(logger *service.Logger, cfg *config.UserConfig, trk *tracker.Tracker) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Create Claude client for debugging
+		client := NewClient(&cfg.Claude, logger)
+
+		// Build game context with full debugging
+		gameContext := client.buildGameContext(trk)
+
+		// Prepare debug response
+		debugInfo := map[string]interface{}{
+			"tracker_data": map[string]interface{}{
+				"active_core":        trk.ActiveCore,
+				"active_game":        trk.ActiveGame,
+				"active_game_name":   trk.ActiveGameName,
+				"active_system_name": trk.ActiveSystemName,
+				"active_game_path":   trk.ActiveGamePath,
+			},
+			"context_data": map[string]interface{}{
+				"core_name":   gameContext.CoreName,
+				"game_name":   gameContext.GameName,
+				"system_name": gameContext.SystemName,
+				"game_path":   gameContext.GamePath,
+			},
+			"detection_results": map[string]interface{}{
+				"is_arcade":       gameContext.SystemName == "Arcade",
+				"extraction_test": client.extractArcadeGameName(trk.ActiveCore),
+			},
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(debugInfo)
+
+		logger.Info("claude debug: Debug info sent to client")
+	}
+}
+
 // HandleGetGameContext returns the current game context processed by Claude
 func HandleGetGameContext(logger *service.Logger, cfg *config.UserConfig, trk *tracker.Tracker) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -1101,132 +1136,5 @@ func HandleGetGameContext(logger *service.Logger, cfg *config.UserConfig, trk *t
 
 		logger.Info("claude game context: returned context for '%s' (%s)",
 			gameContext.GameName, gameContext.SystemName)
-	}
-}
-
-// HandleSAMStatus provides detailed SAM status information for debugging
-func HandleSAMStatus(logger *service.Logger, trk *tracker.Tracker) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var samInfo map[string]interface{}
-
-		if trk.SAMWatcher != nil {
-			samWatcher := trk.SAMWatcher
-			currentGame := samWatcher.GetCurrentSAMGame()
-
-			// Get detailed status information
-			samInfo = map[string]interface{}{
-				"sam_watcher_exists": true,
-				"sam_active":         samWatcher.IsSAMActive(),
-				"current_game": func() interface{} {
-					if currentGame != nil {
-						return map[string]interface{}{
-							"game_name":   currentGame.GameName,
-							"system_name": currentGame.SystemName,
-							"last_update": currentGame.LastUpdate,
-							"is_active":   currentGame.IsActive,
-						}
-					}
-					return nil
-				}(),
-				"file_status": func() map[string]interface{} {
-					status := make(map[string]interface{})
-
-					// Check SAM_Game.txt
-					if info, err := os.Stat("/tmp/SAM_Game.txt"); err == nil {
-						status["sam_game_txt"] = map[string]interface{}{
-							"exists":      true,
-							"mod_time":    info.ModTime(),
-							"age_seconds": time.Since(info.ModTime()).Seconds(),
-						}
-
-						// Read content
-						if content, err := os.ReadFile("/tmp/SAM_Game.txt"); err == nil {
-							status["sam_game_txt"].(map[string]interface{})["content"] = strings.TrimSpace(string(content))
-						}
-					} else {
-						status["sam_game_txt"] = map[string]interface{}{
-							"exists": false,
-							"error":  err.Error(),
-						}
-					}
-
-					// Check for tmux session
-					cmd := exec.Command("tmux", "has-session", "-t", "SAM")
-					tmuxExists := cmd.Run() == nil
-					status["tmux_session"] = map[string]interface{}{
-						"exists": tmuxExists,
-					}
-
-					// Check SAM processes
-					processes := []string{
-						"MiSTer_SAM_on.sh loop_core",
-						"MiSTer_SAM_on.sh initial_start",
-						"MiSTer_SAM_MCP",
-					}
-
-					processStatus := make(map[string]bool)
-					for _, process := range processes {
-						cmd := exec.Command("pgrep", "-f", process)
-						processStatus[process] = cmd.Run() == nil
-					}
-					status["processes"] = processStatus
-
-					// Check temp files
-					tempFiles := []string{
-						"/tmp/.SAM_tmp/SAM.pid",
-						"/tmp/.SAM_tmp/samvideo_init",
-						"/tmp/SAM_Games.log",
-					}
-
-					tempStatus := make(map[string]interface{})
-					for _, file := range tempFiles {
-						if info, err := os.Stat(file); err == nil {
-							tempStatus[file] = map[string]interface{}{
-								"exists":      true,
-								"mod_time":    info.ModTime(),
-								"age_seconds": time.Since(info.ModTime()).Seconds(),
-							}
-						} else {
-							tempStatus[file] = map[string]interface{}{
-								"exists": false,
-							}
-						}
-					}
-					status["temp_files"] = tempStatus
-
-					return status
-				}(),
-			}
-		} else {
-			samInfo = map[string]interface{}{
-				"sam_watcher_exists": false,
-				"error":              "SAM watcher not initialized",
-			}
-		}
-
-		// Add standard tracker info for comparison
-		trackerInfo := map[string]interface{}{
-			"active_core":        trk.ActiveCore,
-			"active_game":        trk.ActiveGame,
-			"active_game_name":   trk.ActiveGameName,
-			"active_system_name": trk.ActiveSystemName,
-			"active_game_path":   trk.ActiveGamePath,
-		}
-
-		response := map[string]interface{}{
-			"sam_status":     samInfo,
-			"tracker_status": trackerInfo,
-			"timestamp":      time.Now(),
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		err := json.NewEncoder(w).Encode(response)
-		if err != nil {
-			logger.Error("sam status: failed to encode response: %s", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		logger.Info("sam status: status information sent")
 	}
 }

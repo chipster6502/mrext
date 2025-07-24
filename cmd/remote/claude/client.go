@@ -251,57 +251,40 @@ Provide helpful, relevant advice based on the game context.`,
 		gameContext.GameName, gameContext.SystemName, gameContext.CoreName, message)
 }
 
-// buildGameContext extracts current game information from tracker with SAM priority
+// buildGameContext extracts current game information from tracker
 func (c *Client) buildGameContext(trk *tracker.Tracker) *GameContext {
-	c.logger.Info("claude debug: === BUILDING GAME CONTEXT WITH SAM SUPPORT ===")
-
-	// ✅ PRIORITY 1: Check if SAM is active and has game info
-	if trk.SAMWatcher != nil && trk.SAMWatcher.IsSAMActive() {
-		samGame := trk.SAMWatcher.GetCurrentSAMGame()
-		if samGame != nil && samGame.GameName != "" {
-			c.logger.Info("claude debug: 🎯 USING SAM DATA")
-			c.logger.Info("claude debug: SAM GameName = '%s'", samGame.GameName)
-			c.logger.Info("claude debug: SAM SystemName = '%s'", samGame.SystemName)
-
-			context := &GameContext{
-				CoreName:    samGame.GameName, // For arcade, core = game
-				GameName:    samGame.GameName,
-				SystemName:  samGame.SystemName,
-				GamePath:    "SAM:" + samGame.GameName, // Special marker
-				LastStarted: samGame.LastUpdate,
-			}
-
-			// ✅ Handle arcade vs console games from SAM
-			if strings.ToLower(samGame.SystemName) == "arcade" {
-				context.CoreName = samGame.GameName
-				context.SystemName = "Arcade"
-				c.logger.Info("claude debug: ✅ SAM ARCADE GAME: '%s'", samGame.GameName)
-			} else {
-				// For console games, try to get actual core name from tracker
-				if trk.ActiveCore != "" {
-					context.CoreName = trk.ActiveCore
-				} else {
-					context.CoreName = samGame.SystemName
-				}
-				c.logger.Info("claude debug: ✅ SAM CONSOLE GAME: '%s' on '%s'",
-					samGame.GameName, context.CoreName)
-			}
-
-			c.logger.Info("claude debug: === SAM FINAL CONTEXT ===")
-			c.logger.Info("claude debug: Final GameName = '%s'", context.GameName)
-			c.logger.Info("claude debug: Final SystemName = '%s'", context.SystemName)
-			c.logger.Info("claude debug: Final CoreName = '%s'", context.CoreName)
-
-			return context
-		}
-	}
-
-	// ✅ PRIORITY 2: Fallback to existing logic when SAM is not active
-	c.logger.Info("claude debug: 📋 SAM NOT ACTIVE - USING STANDARD DETECTION")
+	c.logger.Info("claude debug: === BUILDING GAME CONTEXT ===")
 	c.logger.Info("claude debug: ActiveCore = '%s'", trk.ActiveCore)
 	c.logger.Info("claude debug: ActiveGameName = '%s'", trk.ActiveGameName)
 	c.logger.Info("claude debug: ActiveSystemName = '%s'", trk.ActiveSystemName)
 	c.logger.Info("claude debug: ActiveGamePath = '%s'", trk.ActiveGamePath)
+
+	// ✅ ENHANCED: Extra debugging to understand the problem
+	c.logger.Info("claude debug: === DETAILED TRACKER STATE ===")
+	c.logger.Info("claude debug: GamePath length = %d", len(trk.ActiveGamePath))
+	c.logger.Info("claude debug: GamePath == 'None'? %v", trk.ActiveGamePath == "None")
+	c.logger.Info("claude debug: GamePath == ''? %v", trk.ActiveGamePath == "")
+	if trk.ActiveGamePath != "" && trk.ActiveGamePath != "None" {
+		c.logger.Info("claude debug: 🎯 SHOULD USE FILE METHOD")
+		ext := strings.ToLower(filepath.Ext(trk.ActiveGamePath))
+		c.logger.Info("claude debug: File extension check: '%s'", ext)
+		c.logger.Info("claude debug: Is .mra? %v", strings.HasSuffix(strings.ToLower(trk.ActiveGamePath), ".mra"))
+
+		// ✅ ENHANCED: Check if path looks like a core name instead of file path
+		baseName := filepath.Base(trk.ActiveGamePath)
+		hasSlash := strings.Contains(trk.ActiveGamePath, "/")
+		hasExtension := ext != ""
+		c.logger.Info("claude debug: Path analysis - hasSlash: %v, hasExtension: %v, baseName: '%s'",
+			hasSlash, hasExtension, baseName)
+
+		if !hasExtension && len(baseName) < 10 {
+			c.logger.Warn("claude debug: ⚠️ GamePath looks like core name, not file path!")
+		}
+	} else {
+		c.logger.Info("claude debug: ⚠️ WILL USE FALLBACK METHOD")
+		c.logger.Info("claude debug: Why fallback? GamePath='%s'", trk.ActiveGamePath)
+	}
+	c.logger.Info("claude debug: ===========================")
 
 	context := &GameContext{
 		CoreName:    trk.ActiveCore,
@@ -311,62 +294,60 @@ func (c *Client) buildGameContext(trk *tracker.Tracker) *GameContext {
 		LastStarted: time.Now(),
 	}
 
-	// Process game if we have a valid game path (existing logic)
+	// ✅ ENHANCED: Process game if we have a valid game path
 	if context.GamePath != "" && context.GamePath != "None" {
+		// ✅ CHECK: Is this actually a file path or just a core name?
 		ext := strings.ToLower(filepath.Ext(context.GamePath))
-		c.logger.Info("claude debug: File extension check: '%s'", ext)
+		hasExtension := ext != ""
+		baseName := filepath.Base(context.GamePath)
 
-		// Handle .mra files (arcade)
-		if strings.HasSuffix(strings.ToLower(context.GamePath), ".mra") {
-			c.logger.Info("claude debug: 🎮 MRA FILE DETECTED")
+		if hasExtension {
+			// ✅ VALID FILE PATH: Extract clean game name from file path
+			c.logger.Info("claude debug: 🎯 EXECUTING FILE METHOD (valid file path)")
 
-			// Extract arcade game name from MRA filename
-			gameName := c.extractArcadeGameName(context.CoreName)
-			if gameName != "" {
-				context.GameName = gameName
+			cleanName := c.extractCleanGameName(context.GamePath)
+			if cleanName != "" {
+				context.GameName = cleanName
+				c.logger.Info("claude debug: ✅ EXTRACTED GAME NAME: '%s'", cleanName)
+			}
+
+			// Detect if this is arcade based on file extension
+			if strings.HasSuffix(strings.ToLower(context.GamePath), ".mra") {
 				context.SystemName = "Arcade"
-				c.logger.Info("claude debug: ✅ EXTRACTED ARCADE NAME: '%s'", gameName)
+				c.logger.Info("claude debug: ✅ DETECTED ARCADE from .mra file")
 			} else {
-				context.GameName = context.CoreName
-				context.SystemName = "Arcade"
-				c.logger.Info("claude debug: ⚠️ FALLBACK ARCADE NAME: '%s'", context.CoreName)
-			}
-		} else {
-			// Console/computer games
-			c.logger.Info("claude debug: 🎮 CONSOLE/COMPUTER GAME")
-
-			if context.GameName == "" || context.GameName == "None" {
-				// Extract from filename
-				filename := filepath.Base(context.GamePath)
-				context.GameName = strings.TrimSuffix(filename, filepath.Ext(filename))
-				c.logger.Info("claude debug: ✅ EXTRACTED FROM FILENAME: '%s'", context.GameName)
-			}
-
-			// Enhance system name if available
-			if context.SystemName == "" || context.SystemName == "None" {
-				enhanced := enhanceSystemName(context.CoreName)
-				if enhanced != context.CoreName {
-					context.SystemName = enhanced
-					c.logger.Info("claude debug: ✅ ENHANCED SYSTEM: '%s'", enhanced)
-				} else {
-					context.SystemName = context.CoreName
-					c.logger.Warn("claude debug: ⚠️ SYSTEM = CORE: '%s'", context.CoreName)
+				// For non-arcade games, infer system from path
+				inferredSystem := c.inferSystemFromPath(context.GamePath, context.CoreName)
+				if inferredSystem != "" {
+					context.SystemName = inferredSystem
+					c.logger.Info("claude debug: ✅ INFERRED SYSTEM: '%s'", inferredSystem)
 				}
 			}
-		}
-	} else {
-		// Fallback when no valid game path
-		c.logger.Info("claude debug: ⚠️ NO VALID GAME PATH - USING FALLBACK")
+		} else {
+			// ⚠️ PATH WITHOUT EXTENSION: Likely a core name, treat as fallback
+			c.logger.Warn("claude debug: ⚠️ GamePath has no extension, treating as core name: '%s'", context.GamePath)
 
-		if context.GameName == "" || context.GameName == "None" {
-			context.GameName = context.CoreName
+			if c.isLikelyArcadeCore(baseName) {
+				context.SystemName = "Arcade"
+				context.GameName = c.cleanArcadeCoreName(baseName)
+				c.logger.Info("claude debug: ⚠️ CORE NAME ARCADE: '%s' -> '%s'", baseName, context.GameName)
+			}
 		}
+	} else if context.CoreName != "" {
+		// Fallback: only core name available (shouldn't happen with the fix)
+		c.logger.Warn("claude debug: ⚠️ EXECUTING FALLBACK METHOD")
+		c.logger.Warn("claude debug: ⚠️ GamePath is empty/None: '%s'", context.GamePath)
 
-		if context.SystemName == "" || context.SystemName == "None" {
-			enhanced := enhanceSystemName(context.CoreName)
-			if enhanced != context.CoreName {
+		if c.isLikelyArcadeCore(context.CoreName) {
+			context.SystemName = "Arcade"
+			context.GameName = c.cleanArcadeCoreName(context.CoreName)
+			c.logger.Info("claude debug: ⚠️ FALLBACK ARCADE: '%s' -> '%s'", context.CoreName, context.GameName)
+		} else {
+			c.logger.Warn("claude debug: ⚠️ FALLBACK NON-ARCADE: '%s' not detected as arcade", context.CoreName)
+			// Use names.txt for system enhancement
+			if enhanced := c.getEnhancedSystemName(context.CoreName); enhanced != "" {
 				context.SystemName = enhanced
-				c.logger.Info("claude debug: ✅ ENHANCED SYSTEM: '%s'", enhanced)
+				c.logger.Info("claude debug: ⚠️ ENHANCED SYSTEM: '%s'", enhanced)
 			} else {
 				context.SystemName = context.CoreName
 				c.logger.Warn("claude debug: ⚠️ SYSTEM = CORE: '%s'", context.CoreName)
@@ -374,69 +355,13 @@ func (c *Client) buildGameContext(trk *tracker.Tracker) *GameContext {
 		}
 	}
 
-	c.logger.Info("claude debug: === STANDARD FINAL CONTEXT ===")
+	c.logger.Info("claude debug: === FINAL CONTEXT ===")
 	c.logger.Info("claude debug: Final GameName = '%s'", context.GameName)
 	c.logger.Info("claude debug: Final SystemName = '%s'", context.SystemName)
 	c.logger.Info("claude debug: Final CoreName = '%s'", context.CoreName)
 	c.logger.Info("claude debug: Final GamePath = '%s'", context.GamePath)
 
 	return context
-}
-
-// Helper function to check if the current game info is from SAM
-func (c *Client) isGameFromSAM(trk *tracker.Tracker) bool {
-	return trk.SAMWatcher != nil &&
-		trk.SAMWatcher.IsSAMActive() &&
-		trk.SAMWatcher.GetCurrentSAMGame() != nil
-}
-
-// Enhanced debug endpoint to show SAM status
-func HandleDebugActiveGame(logger *service.Logger, cfg *config.UserConfig, trk *tracker.Tracker) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		client := NewClient(&cfg.Claude, logger)
-		gameContext := client.buildGameContext(trk)
-
-		// ✅ ENHANCED: Include SAM debugging info
-		debugInfo := map[string]interface{}{
-			"sam_info": map[string]interface{}{
-				"sam_active": func() bool {
-					if trk.SAMWatcher != nil {
-						return trk.SAMWatcher.IsSAMActive()
-					}
-					return false
-				}(),
-				"sam_game": func() interface{} {
-					if trk.SAMWatcher != nil && trk.SAMWatcher.IsSAMActive() {
-						return trk.SAMWatcher.GetCurrentSAMGame()
-					}
-					return nil
-				}(),
-				"using_sam_data": client.isGameFromSAM(trk),
-			},
-			"tracker_data": map[string]interface{}{
-				"active_core":        trk.ActiveCore,
-				"active_game":        trk.ActiveGame,
-				"active_game_name":   trk.ActiveGameName,
-				"active_system_name": trk.ActiveSystemName,
-				"active_game_path":   trk.ActiveGamePath,
-			},
-			"context_data": map[string]interface{}{
-				"core_name":   gameContext.CoreName,
-				"game_name":   gameContext.GameName,
-				"system_name": gameContext.SystemName,
-				"game_path":   gameContext.GamePath,
-			},
-			"detection_results": map[string]interface{}{
-				"is_arcade":       gameContext.SystemName == "Arcade",
-				"extraction_test": client.extractArcadeGameName(trk.ActiveCore),
-			},
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(debugInfo)
-
-		logger.Info("claude debug: Debug info sent with SAM status")
-	}
 }
 
 // buildPlaylistPromptGeneric provides fallback for when no games are provided
@@ -1687,59 +1612,4 @@ func (c *Client) cleanArcadeCoreName(coreName string) string {
 
 	c.logger.Info("claude debug: ❌ FALLBACK: returning original name '%s'", name)
 	return name
-}
-
-// enhanceSystemName converts core names to friendly system names
-func enhanceSystemName(coreName string) string {
-	// Common core to system name mappings
-	systemMapping := map[string]string{
-		// Console cores
-		"Genesis":      "Genesis",
-		"MegaDrive":    "Genesis",
-		"SNES":         "Super NES",
-		"NES":          "NES",
-		"GBA":          "Game Boy Advance",
-		"Gameboy":      "Game Boy",
-		"GameboyColor": "Game Boy Color",
-		"PSX":          "PlayStation",
-		"N64":          "Nintendo 64",
-		"SMS":          "Master System",
-		"AtariLynx":    "Atari Lynx",
-		"NeoGeo":       "Neo Geo",
-		"C64":          "Commodore 64",
-		"Minimig":      "Amiga",
-		"ao486":        "PC",
-		"MegaCD":       "Sega CD",
-		"Saturn":       "Saturn",
-		"TurboGrafx16": "TurboGrafx-16",
-
-		// Arcade cores - typically the core name IS the game name
-		"arcade": "Arcade",
-		"ARCADE": "Arcade",
-	}
-
-	// Try direct mapping first
-	if enhanced, exists := systemMapping[coreName]; exists {
-		return enhanced
-	}
-
-	// Try case-insensitive matching
-	lowerCore := strings.ToLower(coreName)
-	for core, system := range systemMapping {
-		if strings.ToLower(core) == lowerCore {
-			return system
-		}
-	}
-
-	// If no mapping found, clean up the core name
-	// Remove common suffixes and clean up
-	cleaned := strings.ReplaceAll(coreName, "_", " ")
-	cleaned = strings.TrimSpace(cleaned)
-
-	// Capitalize first letter
-	if len(cleaned) > 0 {
-		cleaned = strings.ToUpper(cleaned[:1]) + strings.ToLower(cleaned[1:])
-	}
-
-	return cleaned
 }
