@@ -33,11 +33,15 @@ type LastPlayedConfig struct {
 	DisableRecentFolder bool   `ini:"disable_recent_folder,omitempty"`
 }
 
+// RemoteConfig holds configuration for the Remote web server
 type RemoteConfig struct {
 	MdnsService     bool   `ini:"mdns_service,omitempty"`
 	SyncSSHKeys     bool   `ini:"sync_ssh_keys,omitempty"`
 	CustomLogo      string `ini:"custom_logo,omitempty"`
 	AnnounceGameUrl string `ini:"announce_game_url,omitempty"`
+	// ✅ NEW: Host configuration for frontend
+	Host string `ini:"host,omitempty"` // IP or hostname of MiSTer (e.g: "192.168.1.222")
+	Port int    `ini:"port,omitempty"` // Server port (default: 8182)
 }
 
 type NfcConfig struct {
@@ -144,4 +148,16 @@ func (c *ClaudeConfig) ValidateClaudeConfig() error {
 		}
 	}
 	return nil
+}
+
+// GetDefaultRemoteConfig returns safe default configuration values
+func GetDefaultRemoteConfig() RemoteConfig {
+	return RemoteConfig{
+		MdnsService:     true,
+		SyncSSHKeys:     true,
+		CustomLogo:      "",
+		AnnounceGameUrl: "",
+		Host:            "localhost", // Default for development
+		Port:            8182,        // Standard Remote port
+	}
 }

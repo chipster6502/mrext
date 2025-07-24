@@ -261,6 +261,8 @@ func setupApi(sub *mux.Router, kbd input.Keyboard, trk *tracker.Tracker, logger 
 	sub.HandleFunc("/settings/remote/logo", settings.HandleLogoFile(logger, client, cfg)).Methods("GET")
 	sub.HandleFunc("/settings/system/reboot", settings.HandleReboot(logger)).Methods("POST")
 	sub.HandleFunc("/settings/system/generate-mac", settings.HandleGenerateMac(logger)).Methods("GET")
+	// ✅ NEW: Frontend configuration endpoint
+	sub.HandleFunc("/settings/frontend/config", settings.HandleFrontendConfig(logger, cfg)).Methods("GET")
 
 	sub.HandleFunc("/nfc/status", games.NfcStatus(logger)).Methods("GET")
 	sub.HandleFunc("/nfc/write", games.NfcWrite(logger)).Methods("POST")
@@ -306,11 +308,8 @@ func main() {
 	flag.Parse()
 
 	cfg, err := config.LoadUserConfig(appName, &config.UserConfig{
-		Remote: config.RemoteConfig{
-			MdnsService: true,
-			SyncSSHKeys: true,
-			CustomLogo:  "",
-		},
+		Remote: config.GetDefaultRemoteConfig(), // ✅ USE default configuration
+		Claude: config.GetDefaultClaudeConfig(), // Existing
 	})
 	if err != nil {
 		logger.Error("error loading user config: %s", err)
