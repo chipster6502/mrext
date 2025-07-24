@@ -63,6 +63,7 @@ func (f *fakeDb) NoResults(_ error) bool {
 	return true
 }
 
+// Add SAM watcher to the tracker startup
 func StartTracker(logger *service.Logger, cfg *config.UserConfig) (*tracker.Tracker, func() error, error) {
 	tr, err := tracker.NewTracker(logger, cfg, &fakeDb{
 		logger: logger,
@@ -81,10 +82,25 @@ func StartTracker(logger *service.Logger, cfg *config.UserConfig) (*tracker.Trac
 		}
 	}
 
+	// Start regular file watcher
 	watcher, err := tracker.StartFileWatch(tr)
 	if err != nil {
 		tr.Logger.Error("error starting file watch: %s", err)
 		return nil, nil, err
+	}
+
+	// ✅ NEW: Start SAM watcher
+	samWatcher, err := tracker.NewSAMWatcher(logger, tr)
+	if err != nil {
+		tr.Logger.Error("error creating SAM watcher: %s", err)
+		// Don't fail if SAM watcher can't start, continue with regular tracking
+	} else {
+		err = samWatcher.Start()
+		if err != nil {
+			tr.Logger.Error("error starting SAM watcher: %s", err)
+		}
+		// Store SAM watcher in tracker for later use
+		tr.SAMWatcher = samWatcher
 	}
 
 	tr.StartTicker(0)
@@ -94,6 +110,15 @@ func StartTracker(logger *service.Logger, cfg *config.UserConfig) (*tracker.Trac
 		if err != nil {
 			tr.Logger.Error("error closing file watcher: %s", err)
 		}
+
+		// ✅ NEW: Stop SAM watcher
+		if tr.SAMWatcher != nil {
+			err := tr.SAMWatcher.Stop()
+			if err != nil {
+				tr.Logger.Error("error stopping SAM watcher: %s", err)
+			}
+		}
+
 		tr.StopAll()
 		return nil
 	}, nil
