@@ -1098,7 +1098,7 @@ func HandleDebugActiveGame(logger *service.Logger, cfg *config.UserConfig, trk *
 	}
 }
 
-// HandleGetGameContext returns the current game context processed by Claude
+// Updated HandleGetGameContext in cmd/remote/claude/handlers.go
 func HandleGetGameContext(logger *service.Logger, cfg *config.UserConfig, trk *tracker.Tracker) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Only allow GET requests
@@ -1113,13 +1113,17 @@ func HandleGetGameContext(logger *service.Logger, cfg *config.UserConfig, trk *t
 		// Build game context with Claude processing
 		gameContext := client.buildGameContext(trk)
 
-		// Prepare response with clean data
+		// ✅ Check if SAM is actually active right now
+		samActive := client.isSAMActive()
+
+		// Prepare response with clean data + sam_active flag
 		response := map[string]interface{}{
 			"core_name":    gameContext.CoreName,
 			"game_name":    gameContext.GameName,
 			"system_name":  gameContext.SystemName,
 			"game_path":    gameContext.GamePath,
 			"last_started": gameContext.LastStarted,
+			"sam_active":   samActive, // ✅ NEW: Include SAM status
 			"timestamp":    time.Now(),
 		}
 
@@ -1134,7 +1138,7 @@ func HandleGetGameContext(logger *service.Logger, cfg *config.UserConfig, trk *t
 			return
 		}
 
-		logger.Info("claude game context: returned context for '%s' (%s)",
-			gameContext.GameName, gameContext.SystemName)
+		logger.Info("claude game context: returned context for '%s' (%s) - SAM active: %v",
+			gameContext.GameName, gameContext.SystemName, samActive)
 	}
 }
