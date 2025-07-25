@@ -287,8 +287,6 @@ func (c *Client) parseSAMGameInfo() (gameName, systemName string, err error) {
 	return gameName, systemName, nil
 }
 
-// Add verification to check if SAM is actually running the current game
-
 func (c *Client) buildGameContext(trk *tracker.Tracker) *GameContext {
 	c.logger.Info("claude debug: === BUILDING GAME CONTEXT ===")
 
@@ -302,7 +300,7 @@ func (c *Client) buildGameContext(trk *tracker.Tracker) *GameContext {
 		} else {
 			c.logger.Info("claude debug: 📋 SAM GAME INFO - Game: '%s', System: '%s'", gameName, systemName)
 
-			// ✅ NEW: Verify if SAM's game matches the current tracker state
+			// Verify if SAM's game matches the current tracker state
 			samIsRunningCurrentGame := c.verifySAMGameMatch(trk, gameName, systemName)
 
 			if samIsRunningCurrentGame {
@@ -311,7 +309,7 @@ func (c *Client) buildGameContext(trk *tracker.Tracker) *GameContext {
 					CoreName:    systemName,
 					GameName:    gameName,
 					SystemName:  systemName,
-					GamePath:    "/tmp/SAM_Game.txt", // Indicate this came from SAM
+					GamePath:    "/tmp/SAM_Game.txt",
 					LastStarted: time.Now(),
 				}
 			} else {
@@ -320,7 +318,7 @@ func (c *Client) buildGameContext(trk *tracker.Tracker) *GameContext {
 		}
 	}
 
-	// ✅ STEP 2: Standard detection (ORIGINAL LOGIC - preserved exactly)
+	// ✅ STEP 2: Standard detection (SIMPLIFIED - removed arcade core logic)
 	c.logger.Info("claude debug: 🔄 Using standard detection method")
 	c.logger.Info("claude debug: ActiveCore = '%s'", trk.ActiveCore)
 	c.logger.Info("claude debug: ActiveGameName = '%s'", trk.ActiveGameName)
@@ -335,27 +333,33 @@ func (c *Client) buildGameContext(trk *tracker.Tracker) *GameContext {
 		LastStarted: time.Now(),
 	}
 
-	// ✅ ORIGINAL LOGIC: Process game if we have a valid game path
+	// ✅ SIMPLIFIED: Only process if we have a valid game path with extension
 	if context.GamePath != "" && context.GamePath != "None" {
 		ext := strings.ToLower(filepath.Ext(context.GamePath))
 		hasExtension := ext != ""
 
 		if hasExtension {
-			// Valid file path: Extract clean game name from file path
 			c.logger.Info("claude debug: 🎯 EXECUTING FILE METHOD (valid file path)")
 
-			cleanName := c.extractCleanGameName(context.GamePath)
-			if cleanName != "" {
-				context.GameName = cleanName
-				c.logger.Info("claude debug: ✅ EXTRACTED GAME NAME: '%s'", cleanName)
-			}
-
-			// Detect if this is arcade based on file extension
+			// ✅ Special handling for .mra files (arcade games)
 			if strings.HasSuffix(strings.ToLower(context.GamePath), ".mra") {
+				// For .mra files, use the complete filename without extension
+				fileName := filepath.Base(context.GamePath)
+				gameNameFromFile := strings.TrimSuffix(fileName, ".mra")
+
+				context.GameName = gameNameFromFile
 				context.SystemName = "Arcade"
-				c.logger.Info("claude debug: ✅ DETECTED ARCADE from .mra file")
+
+				c.logger.Info("claude debug: ✅ ARCADE MRA FILE - Using complete filename: '%s'", gameNameFromFile)
 			} else {
-				// For non-arcade games, infer system from path
+				// For non-arcade games, use the existing clean extraction logic
+				cleanName := c.extractCleanGameName(context.GamePath)
+				if cleanName != "" {
+					context.GameName = cleanName
+					c.logger.Info("claude debug: ✅ EXTRACTED CLEAN NAME: '%s'", cleanName)
+				}
+
+				// Infer system from path for non-arcade games
 				inferredSystem := c.inferSystemFromPath(context.GamePath, context.CoreName)
 				if inferredSystem != "" {
 					context.SystemName = inferredSystem
@@ -363,29 +367,17 @@ func (c *Client) buildGameContext(trk *tracker.Tracker) *GameContext {
 				}
 			}
 		} else {
-			// Path without extension: Likely a core name, treat as fallback
-			c.logger.Warn("claude debug: ⚠️ GamePath has no extension, treating as core name: '%s'", context.GamePath)
-
-			if c.isLikelyArcadeCore(filepath.Base(context.GamePath)) {
-				context.SystemName = "Arcade"
-				context.GameName = c.cleanArcadeCoreName(filepath.Base(context.GamePath))
-				c.logger.Info("claude debug: ⚠️ CORE NAME ARCADE: '%s' -> '%s'", filepath.Base(context.GamePath), context.GameName)
-			}
+			// ✅ REMOVED: No more arcade core name detection logic
+			c.logger.Info("claude debug: ⚠️ GamePath has no extension - skipping file processing")
 		}
-	} else if context.CoreName != "" {
-		// ✅ ORIGINAL FALLBACK: only core name available
-		c.logger.Warn("claude debug: ⚠️ EXECUTING FALLBACK METHOD")
+	}
 
-		if c.isLikelyArcadeCore(context.CoreName) {
-			context.SystemName = "Arcade"
-			context.GameName = c.cleanArcadeCoreName(context.CoreName)
-			c.logger.Info("claude debug: ⚠️ FALLBACK ARCADE: '%s' -> '%s'", context.CoreName, context.GameName)
-		} else {
-			// Use names.txt for system enhancement
-			if enhanced := c.getEnhancedSystemName(context.CoreName); enhanced != "" {
-				context.SystemName = enhanced
-				c.logger.Info("claude debug: ✅ ENHANCED SYSTEM: '%s' -> '%s'", context.CoreName, enhanced)
-			}
+	// ✅ SIMPLIFIED: Basic fallback without arcade detection
+	if context.CoreName != "" && (context.SystemName == "" || context.SystemName == context.CoreName) {
+		// Use names.txt for system enhancement
+		if enhanced := c.getEnhancedSystemName(context.CoreName); enhanced != "" {
+			context.SystemName = enhanced
+			c.logger.Info("claude debug: ✅ ENHANCED SYSTEM: '%s' -> '%s'", context.CoreName, enhanced)
 		}
 	}
 
@@ -836,11 +828,9 @@ func (c *Client) extractArcadeGameName(coreName string) string {
 
 	c.logger.Info("claude debug: ❌ MATCH REJECTED: score %d < 70, trying fallback", bestScore)
 
-	if c.isLikelyArcadeCore(coreName) {
-		cleaned := c.cleanCoreName(coreName)
-		c.logger.Info("claude debug: ✅ FALLBACK: Using cleaned core name '%s' -> '%s'", coreName, cleaned)
-		return cleaned
-	}
+	// ✅ DISABLED: Basic fallback without arcade detection
+	c.logger.Info("claude debug: ❌ NO MATCH FOUND: Using core name as-is '%s'", coreName)
+	return coreName
 
 	c.logger.Info("claude debug: ❌ NOT ARCADE: Core '%s' doesn't appear to be arcade", coreName)
 	return ""
@@ -929,6 +919,7 @@ func (c *Client) similarStrings(a, b string) bool {
 	return float64(commonChars)/float64(len(shorter)) >= 0.7
 }
 
+/*
 // isLikelyArcadeCore determines if a core name likely represents an arcade game
 func (c *Client) isLikelyArcadeCore(coreName string) bool {
 	c.logger.Info("claude debug: === ARCADE DETECTION ===")
@@ -1039,7 +1030,9 @@ func (c *Client) isLikelyArcadeCore(coreName string) bool {
 	c.logger.Info("claude debug: ❌ FINAL RESULT: Not arcade")
 	return false
 }
+*/
 
+/*
 // cleanCoreName cleans up a core name for display
 func (c *Client) cleanCoreName(coreName string) string {
 	name := strings.TrimSuffix(coreName, ".rbf")
@@ -1054,6 +1047,7 @@ func (c *Client) cleanCoreName(coreName string) string {
 
 	return strings.Join(words, " ")
 }
+*/
 
 // callAnthropicAPI makes the actual HTTP request to Claude API
 func (c *Client) callAnthropicAPI(ctx context.Context, request *AnthropicRequest) (*AnthropicResponse, error) {
@@ -1541,6 +1535,7 @@ func (c *Client) getEnhancedSystemName(coreName string) string {
 	return ""
 }
 
+/*
 // cleanArcadeCoreName provides fallback cleaning for core names (rarely used now)
 func (c *Client) cleanArcadeCoreName(coreName string) string {
 	c.logger.Info("claude debug: === CLEANING ARCADE CORE NAME ===")
@@ -1709,3 +1704,4 @@ func (c *Client) cleanArcadeCoreName(coreName string) string {
 	c.logger.Info("claude debug: ❌ FALLBACK: returning original name '%s'", name)
 	return name
 }
+*/
