@@ -388,10 +388,14 @@ func (c *Client) buildGameContext(trk *tracker.Tracker) *GameContext {
 	return context
 }
 
+// Enhanced verifySAMGameMatch function in cmd/remote/claude/client.go
+// Compare SAM content directly with tracker state
+
 func (c *Client) verifySAMGameMatch(trk *tracker.Tracker, samGameName, samSystemName string) bool {
 	c.logger.Info("claude debug: === VERIFYING SAM GAME MATCH ===")
 	c.logger.Info("claude debug: SAM Game: '%s', SAM System: '%s'", samGameName, samSystemName)
 	c.logger.Info("claude debug: Tracker Core: '%s', Tracker Game: '%s'", trk.ActiveCore, trk.ActiveGameName)
+	c.logger.Info("claude debug: Tracker GamePath: '%s'", trk.ActiveGamePath)
 
 	// If tracker has no active game, SAM is probably running it
 	if trk.ActiveCore == "" || trk.ActiveCore == "None" {
@@ -399,21 +403,40 @@ func (c *Client) verifySAMGameMatch(trk *tracker.Tracker, samGameName, samSystem
 		return true
 	}
 
-	// ✅ IMPROVED: Case 1: Arcade games - use simplified verification
+	// ✅ IMPROVED: Direct content comparison for arcade games
 	if samSystemName == "arcade" || samSystemName == "Arcade" {
-		// For arcade games, if SAM says it's running arcade and tracker has an active core,
-		// we assume SAM is running it because core names (.rbf) and .mra names rarely match exactly
-		if trk.ActiveCore != "" && trk.ActiveCore != "None" {
-			c.logger.Info("claude debug: ✅ ARCADE SIMPLIFIED MATCH - SAM running arcade, tracker has active core '%s'", trk.ActiveCore)
-			c.logger.Info("claude debug: Note: Using SAM's full game name instead of core name for better display")
+		if trk.ActiveGameName != "" && strings.EqualFold(samGameName, trk.ActiveGameName) {
+			c.logger.Info("claude debug: ✅ ARCADE MATCH - SAM game '%s' matches tracker ActiveGameName '%s'", samGameName, trk.ActiveGameName)
 			return true
+		}
+		// For arcade, compare SAM's game name with the actual .mra file being loaded
+		if trk.ActiveGamePath != "" && strings.HasSuffix(strings.ToLower(trk.ActiveGamePath), ".mra") {
+			// Extract the actual .mra filename without extension
+			actualFileName := filepath.Base(trk.ActiveGamePath)
+			actualGameName := strings.TrimSuffix(actualFileName, ".mra")
+
+			c.logger.Info("claude debug: ARCADE COMPARISON - SAM: '%s' vs Actual: '%s'", samGameName, actualGameName)
+
+			if strings.EqualFold(samGameName, actualGameName) {
+				c.logger.Info("claude debug: ✅ ARCADE DIRECT MATCH - SAM and tracker have same game")
+				return true
+			} else {
+				c.logger.Info("claude debug: ❌ ARCADE MISMATCH - SAM and tracker have different games")
+				return false
+			}
 		} else {
-			c.logger.Info("claude debug: ❌ ARCADE NO ACTIVE CORE")
+			// Fallback: compare with core name for arcade
+			if strings.EqualFold(samGameName, trk.ActiveCore) {
+				c.logger.Info("claude debug: ✅ ARCADE CORE MATCH - SAM game matches tracker core")
+				return true
+			} else {
+				c.logger.Info("claude debug: ❌ ARCADE CORE MISMATCH - SAM: '%s' vs Core: '%s'", samGameName, trk.ActiveCore)
+				return false
+			}
 		}
 	}
 
-	// Case 2: Console games - check system correspondence (keep existing logic)
-	// Map SAM system names to expected core names
+	// Case 2: Console games - check system correspondence
 	samToCoreMap := map[string][]string{
 		"neogeo":    {"NEOGEO", "neogeo"},
 		"genesis":   {"Genesis", "MegaDrive"},
