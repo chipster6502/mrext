@@ -287,30 +287,40 @@ func (c *Client) parseSAMGameInfo() (gameName, systemName string, err error) {
 	return gameName, systemName, nil
 }
 
+// Add verification to check if SAM is actually running the current game
+
 func (c *Client) buildGameContext(trk *tracker.Tracker) *GameContext {
 	c.logger.Info("claude debug: === BUILDING GAME CONTEXT ===")
 
-	// ✅ STEP 1: SAM detection (NEW - should be first)
+	// ✅ STEP 1: SAM detection with verification
 	if c.isSAMActive() {
-		c.logger.Info("claude debug: 🎯 SAM DETECTED - Using SAM game info")
+		c.logger.Info("claude debug: 🎯 SAM SESSION DETECTED - Checking if SAM is running current game")
 
 		gameName, systemName, err := c.parseSAMGameInfo()
 		if err != nil {
 			c.logger.Warn("claude debug: ⚠️ SAM active but failed to parse game info: %s", err)
 		} else {
-			c.logger.Info("claude debug: ✅ SAM GAME INFO - Game: '%s', System: '%s'", gameName, systemName)
+			c.logger.Info("claude debug: 📋 SAM GAME INFO - Game: '%s', System: '%s'", gameName, systemName)
 
-			return &GameContext{
-				CoreName:    systemName,
-				GameName:    gameName,
-				SystemName:  systemName,
-				GamePath:    "/tmp/SAM_Game.txt", // Indicate this came from SAM
-				LastStarted: time.Now(),
+			// ✅ NEW: Verify if SAM's game matches the current tracker state
+			samIsRunningCurrentGame := c.verifySAMGameMatch(trk, gameName, systemName)
+
+			if samIsRunningCurrentGame {
+				c.logger.Info("claude debug: ✅ SAM IS RUNNING CURRENT GAME - Using SAM info")
+				return &GameContext{
+					CoreName:    systemName,
+					GameName:    gameName,
+					SystemName:  systemName,
+					GamePath:    "/tmp/SAM_Game.txt", // Indicate this came from SAM
+					LastStarted: time.Now(),
+				}
+			} else {
+				c.logger.Info("claude debug: ⚠️ SAM IS IN BACKGROUND - User loaded manual game, using standard detection")
 			}
 		}
 	}
 
-	// ✅ STEP 2: Standard detection (ORIGINAL LOGIC - must be preserved exactly)
+	// ✅ STEP 2: Standard detection (ORIGINAL LOGIC - preserved exactly)
 	c.logger.Info("claude debug: 🔄 Using standard detection method")
 	c.logger.Info("claude debug: ActiveCore = '%s'", trk.ActiveCore)
 	c.logger.Info("claude debug: ActiveGameName = '%s'", trk.ActiveGameName)
@@ -384,6 +394,67 @@ func (c *Client) buildGameContext(trk *tracker.Tracker) *GameContext {
 	c.logger.Info("claude debug: Final SystemName = '%s'", context.SystemName)
 
 	return context
+}
+
+// ✅ NEW FUNCTION: Verify if SAM's game matches current tracker state
+func (c *Client) verifySAMGameMatch(trk *tracker.Tracker, samGameName, samSystemName string) bool {
+	c.logger.Info("claude debug: === VERIFYING SAM GAME MATCH ===")
+	c.logger.Info("claude debug: SAM Game: '%s', SAM System: '%s'", samGameName, samSystemName)
+	c.logger.Info("claude debug: Tracker Core: '%s', Tracker Game: '%s'", trk.ActiveCore, trk.ActiveGameName)
+
+	// If tracker has no active game, SAM is probably running it
+	if trk.ActiveCore == "" || trk.ActiveCore == "None" {
+		c.logger.Info("claude debug: ✅ No tracker game - SAM is running current game")
+		return true
+	}
+
+	// Case 1: Arcade games - check if core name matches
+	if samSystemName == "arcade" || samSystemName == "Arcade" {
+		// For arcade, the core name should match the game name in SAM
+		if strings.EqualFold(trk.ActiveCore, samSystemName) {
+			c.logger.Info("claude debug: ✅ ARCADE MATCH - SAM running arcade game")
+			return true
+		}
+	}
+
+	// Case 2: Console games - check system correspondence
+	// Map SAM system names to expected core names
+	samToCoreMap := map[string][]string{
+		"neogeo":    {"NEOGEO", "neogeo"},
+		"genesis":   {"Genesis", "MegaDrive"},
+		"snes":      {"SNES"},
+		"nes":       {"NES"},
+		"n64":       {"N64", "Nintendo64"},
+		"psx":       {"PSX", "PlayStation"},
+		"saturn":    {"Saturn"},
+		"gameboy":   {"Gameboy", "GB"},
+		"gbc":       {"GameboyColor", "GBC"},
+		"gba":       {"GBA"},
+		"atari2600": {"Atari2600", "A2600"},
+		"megacd":    {"MegaCD", "SegaCD"},
+		"tgfx16":    {"TurboGrafx16", "TGFX16"},
+		"sms":       {"SMS", "MasterSystem"},
+	}
+
+	samSystemLower := strings.ToLower(samSystemName)
+	if expectedCores, exists := samToCoreMap[samSystemLower]; exists {
+		for _, expectedCore := range expectedCores {
+			if strings.EqualFold(trk.ActiveCore, expectedCore) {
+				c.logger.Info("claude debug: ✅ SYSTEM MATCH - SAM system '%s' matches tracker core '%s'", samSystemName, trk.ActiveCore)
+				return true
+			}
+		}
+	}
+
+	// Case 3: Direct system name match
+	if strings.EqualFold(samSystemName, trk.ActiveCore) {
+		c.logger.Info("claude debug: ✅ DIRECT MATCH - SAM system matches tracker core")
+		return true
+	}
+
+	c.logger.Info("claude debug: ❌ NO MATCH - SAM game doesn't match current tracker state")
+	c.logger.Info("claude debug: This means user loaded a manual game while SAM is in background")
+	return false
 }
 
 // buildPlaylistPromptGeneric provides fallback for when no games are provided
