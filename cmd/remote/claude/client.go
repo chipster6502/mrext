@@ -396,7 +396,6 @@ func (c *Client) buildGameContext(trk *tracker.Tracker) *GameContext {
 	return context
 }
 
-// ✅ NEW FUNCTION: Verify if SAM's game matches current tracker state
 func (c *Client) verifySAMGameMatch(trk *tracker.Tracker, samGameName, samSystemName string) bool {
 	c.logger.Info("claude debug: === VERIFYING SAM GAME MATCH ===")
 	c.logger.Info("claude debug: SAM Game: '%s', SAM System: '%s'", samGameName, samSystemName)
@@ -408,16 +407,20 @@ func (c *Client) verifySAMGameMatch(trk *tracker.Tracker, samGameName, samSystem
 		return true
 	}
 
-	// Case 1: Arcade games - check if core name matches
+	// ✅ IMPROVED: Case 1: Arcade games - use simplified verification
 	if samSystemName == "arcade" || samSystemName == "Arcade" {
-		// For arcade, the core name should match the game name in SAM
-		if strings.EqualFold(trk.ActiveCore, samSystemName) {
-			c.logger.Info("claude debug: ✅ ARCADE MATCH - SAM running arcade game")
+		// For arcade games, if SAM says it's running arcade and tracker has an active core,
+		// we assume SAM is running it because core names (.rbf) and .mra names rarely match exactly
+		if trk.ActiveCore != "" && trk.ActiveCore != "None" {
+			c.logger.Info("claude debug: ✅ ARCADE SIMPLIFIED MATCH - SAM running arcade, tracker has active core '%s'", trk.ActiveCore)
+			c.logger.Info("claude debug: Note: Using SAM's full game name instead of core name for better display")
 			return true
+		} else {
+			c.logger.Info("claude debug: ❌ ARCADE NO ACTIVE CORE")
 		}
 	}
 
-	// Case 2: Console games - check system correspondence
+	// Case 2: Console games - check system correspondence (keep existing logic)
 	// Map SAM system names to expected core names
 	samToCoreMap := map[string][]string{
 		"neogeo":    {"NEOGEO", "neogeo"},
