@@ -287,38 +287,126 @@ func (c *Client) parseSAMGameInfo() (gameName, systemName string, err error) {
 	return gameName, systemName, nil
 }
 
+// convertSAMSystemName converts SAM system codes to descriptive names
+func (c *Client) convertSAMSystemName(samSystemCode string) string {
+	// Map of SAM system codes to descriptive names
+	samSystemMap := map[string]string{
+		"amiga":     "Commodore Amiga",
+		"amigacd32": "Commodore Amiga CD32",
+		"ao486":     "PC Intel 486 SX",
+		"arcade":    "Arcade",
+		"atari2600": "Atari 2600",
+		"atari5200": "Atari 5200",
+		"atari7800": "Atari 7800",
+		"atarilynx": "Atari Lynx",
+		"c64":       "Commodore 64",
+		"fds":       "Famicom Disk System",
+		"gb":        "Game Boy",
+		"gbc":       "Game Boy Color",
+		"gba":       "Game Boy Advance",
+		"genesis":   "Sega Genesis / Mega Drive",
+		"megacd":    "Sega Mega-CD",
+		"n64":       "Nintendo 64",
+		"neogeo":    "Neo-Geo AES",
+		"nes":       "Nintendo Entertainment System",
+		"s32x":      "Sega 32X",
+		"saturn":    "Sega Saturn",
+		"sms":       "Sega Master System",
+		"snes":      "Super Nintendo",
+		"tgfx16":    "PC Engine / TurboGrafx-16",
+		"tgfx16cd":  "PC Engine CD / TurboGrafx-16 CD",
+		"psx":       "PlayStation 1",
+		"x68k":      "Sharp X68000",
+	}
+
+	// Convert to lowercase for case-insensitive matching
+	lowerCode := strings.ToLower(strings.TrimSpace(samSystemCode))
+
+	if descriptiveName, exists := samSystemMap[lowerCode]; exists {
+		c.logger.Info("claude debug: ✅ SAM SYSTEM CONVERSION: '%s' -> '%s'", samSystemCode, descriptiveName)
+		return descriptiveName
+	}
+
+	// If no mapping found, return original name
+	c.logger.Info("claude debug: ⚠️ SAM SYSTEM UNCHANGED: '%s' (no mapping found)", samSystemCode)
+	return samSystemCode
+}
+
 // detectSAMTrackerInconsistency detects when SAM has loaded a new game
 // but tracker still has stale path information from a previous game
+
 func (c *Client) detectSAMTrackerInconsistency(trk *tracker.Tracker, samGameName, samSystemName string) bool {
+	c.logger.Info("claude debug: === DETECTING SAM/TRACKER INCONSISTENCY ===")
+	c.logger.Info("claude debug: SAM Game: '%s', SAM System: '%s'", samGameName, samSystemName)
+	c.logger.Info("claude debug: Tracker ActiveGameName: '%s'", trk.ActiveGameName)
+	c.logger.Info("claude debug: Tracker ActiveGamePath: '%s'", trk.ActiveGamePath)
+
 	// Only applies to arcade games where this inconsistency commonly occurs
 	if samSystemName != "arcade" && samSystemName != "Arcade" {
+		c.logger.Info("claude debug: ❌ Not arcade system - skipping inconsistency check")
 		return false
 	}
 
-	// Check if names match but paths don't (indicating tracker lag)
+	// ✅ CASE 1: Names match but paths don't (tracker lag with same game)
 	activeNameMatch := trk.ActiveGameName != "" && strings.EqualFold(samGameName, trk.ActiveGameName)
+	c.logger.Info("claude debug: CASE 1 CHECK - activeNameMatch: %v", activeNameMatch)
 
-	if !activeNameMatch {
-		return false // No inconsistency if names don't match
-	}
+	if activeNameMatch {
+		c.logger.Info("claude debug: Names match - checking if paths are different...")
+		// If ActiveGamePath is present, check if it represents a different game
+		if trk.ActiveGamePath != "" && strings.HasSuffix(strings.ToLower(trk.ActiveGamePath), ".mra") {
+			actualFileName := filepath.Base(trk.ActiveGamePath)
+			actualGameName := strings.TrimSuffix(actualFileName, ".mra")
 
-	// If ActiveGamePath is present, check if it represents a different game
-	if trk.ActiveGamePath != "" && strings.HasSuffix(strings.ToLower(trk.ActiveGamePath), ".mra") {
-		actualFileName := filepath.Base(trk.ActiveGamePath)
-		actualGameName := strings.TrimSuffix(actualFileName, ".mra")
+			c.logger.Info("claude debug: Extracted path game name: '%s'", actualGameName)
 
-		pathMatch := strings.EqualFold(samGameName, actualGameName)
+			pathMatch := strings.EqualFold(samGameName, actualGameName)
+			c.logger.Info("claude debug: Path match check: %v", pathMatch)
 
-		if !pathMatch {
-			c.logger.Info("claude debug: 🔍 SAM/TRACKER INCONSISTENCY DETECTED")
-			c.logger.Info("claude debug: - SAM Game: '%s'", samGameName)
-			c.logger.Info("claude debug: - Tracker ActiveGameName: '%s' (matches ✅)", trk.ActiveGameName)
-			c.logger.Info("claude debug: - Tracker ActiveGamePath: '%s' -> '%s' (different ❌)", trk.ActiveGamePath, actualGameName)
-			c.logger.Info("claude debug: This indicates SAM loaded a new game but tracker path is stale")
-			return true
+			if !pathMatch {
+				c.logger.Info("claude debug: 🔍 SAM/TRACKER INCONSISTENCY DETECTED (Type 1)")
+				c.logger.Info("claude debug: - SAM Game: '%s'", samGameName)
+				c.logger.Info("claude debug: - Tracker ActiveGameName: '%s' (matches ✅)", trk.ActiveGameName)
+				c.logger.Info("claude debug: - Tracker ActiveGamePath: '%s' -> '%s' (different ❌)", trk.ActiveGamePath, actualGameName)
+				c.logger.Info("claude debug: This indicates SAM loaded a new game but tracker path is stale")
+				return true
+			} else {
+				c.logger.Info("claude debug: ✅ CASE 1: Names and paths both match - no inconsistency")
+			}
+		} else {
+			c.logger.Info("claude debug: ⚠️ CASE 1: Names match but no valid .mra path to compare")
 		}
 	}
 
+	// ✅ CASE 2: Completely different games (SAM next command scenario)
+	c.logger.Info("claude debug: CASE 2 CHECK - different games scenario")
+	if !activeNameMatch && trk.ActiveGamePath != "" {
+		actualFileName := filepath.Base(trk.ActiveGamePath)
+		actualGameName := strings.TrimSuffix(actualFileName, filepath.Ext(actualFileName))
+
+		c.logger.Info("claude debug: CASE 2 - Extracted path game name: '%s'", actualGameName)
+		c.logger.Info("claude debug: CASE 2 - Path file type: '%s'", filepath.Ext(trk.ActiveGamePath))
+
+		// Check if SAM game is completely different from tracker path
+		pathMatch := strings.EqualFold(samGameName, actualGameName)
+		c.logger.Info("claude debug: CASE 2 - Path match check: %v", pathMatch)
+
+		if !pathMatch {
+			c.logger.Info("claude debug: 🔍 SAM/TRACKER INCONSISTENCY DETECTED (Type 2)")
+			c.logger.Info("claude debug: - SAM Game: '%s' (%s)", samGameName, samSystemName)
+			c.logger.Info("claude debug: - Tracker ActiveGameName: '%s' (different)", trk.ActiveGameName)
+			c.logger.Info("claude debug: - Tracker ActiveGamePath: '%s' -> '%s' (different)", trk.ActiveGamePath, actualGameName)
+			c.logger.Info("claude debug: This indicates SAM loaded a new game but tracker has stale data from previous game")
+			return true
+		} else {
+			c.logger.Info("claude debug: ⚠️ CASE 2: Unexpectedly, SAM game matches path game")
+		}
+	} else {
+		c.logger.Info("claude debug: ⚠️ CASE 2: Conditions not met - activeNameMatch: %v, hasValidPath: %v",
+			!activeNameMatch,
+			trk.ActiveGamePath != "")
+	}
+	c.logger.Info("claude debug: ❌ NO INCONSISTENCY DETECTED - proceeding with normal verification")
 	return false
 }
 
@@ -341,7 +429,7 @@ func (c *Client) buildGameContext(trk *tracker.Tracker) *GameContext {
 				return &GameContext{
 					CoreName:    systemName,
 					GameName:    gameName,
-					SystemName:  systemName,
+					SystemName:  c.convertSAMSystemName(systemName),
 					GamePath:    "/tmp/SAM_Game.txt",
 					LastStarted: time.Now(),
 				}
@@ -355,7 +443,7 @@ func (c *Client) buildGameContext(trk *tracker.Tracker) *GameContext {
 				return &GameContext{
 					CoreName:    systemName,
 					GameName:    gameName,
-					SystemName:  systemName,
+					SystemName:  c.convertSAMSystemName(systemName),
 					GamePath:    "/tmp/SAM_Game.txt",
 					LastStarted: time.Now(),
 				}
@@ -523,84 +611,6 @@ func (c *Client) verifySAMGameMatch(trk *tracker.Tracker, samGameName, samSystem
 
 	c.logger.Info("claude debug: ❌ NO MATCH - SAM game doesn't match current tracker state")
 	c.logger.Info("claude debug: This means user loaded a manual game while SAM is in background")
-	return false
-}
-
-// detectSAMTrackerInconsistency detects when SAM has loaded a new game
-// but tracker still has stale path information from a previous game
-
-func (c *Client) detectSAMTrackerInconsistency(trk *tracker.Tracker, samGameName, samSystemName string) bool {
-	c.logger.Info("claude debug: === DETECTING SAM/TRACKER INCONSISTENCY ===")
-	c.logger.Info("claude debug: SAM Game: '%s', SAM System: '%s'", samGameName, samSystemName)
-	c.logger.Info("claude debug: Tracker ActiveGameName: '%s'", trk.ActiveGameName)
-	c.logger.Info("claude debug: Tracker ActiveGamePath: '%s'", trk.ActiveGamePath)
-
-	// Only applies to arcade games where this inconsistency commonly occurs
-	if samSystemName != "arcade" && samSystemName != "Arcade" {
-		c.logger.Info("claude debug: ❌ Not arcade system - skipping inconsistency check")
-		return false
-	}
-
-	// ✅ CASE 1: Names match but paths don't (tracker lag with same game)
-	activeNameMatch := trk.ActiveGameName != "" && strings.EqualFold(samGameName, trk.ActiveGameName)
-	c.logger.Info("claude debug: CASE 1 CHECK - activeNameMatch: %v", activeNameMatch)
-
-	if activeNameMatch {
-		c.logger.Info("claude debug: Names match - checking if paths are different...")
-		// If ActiveGamePath is present, check if it represents a different game
-		if trk.ActiveGamePath != "" && strings.HasSuffix(strings.ToLower(trk.ActiveGamePath), ".mra") {
-			actualFileName := filepath.Base(trk.ActiveGamePath)
-			actualGameName := strings.TrimSuffix(actualFileName, ".mra")
-
-			c.logger.Info("claude debug: Extracted path game name: '%s'", actualGameName)
-
-			pathMatch := strings.EqualFold(samGameName, actualGameName)
-			c.logger.Info("claude debug: Path match check: %v", pathMatch)
-
-			if !pathMatch {
-				c.logger.Info("claude debug: 🔍 SAM/TRACKER INCONSISTENCY DETECTED (Type 1)")
-				c.logger.Info("claude debug: - SAM Game: '%s'", samGameName)
-				c.logger.Info("claude debug: - Tracker ActiveGameName: '%s' (matches ✅)", trk.ActiveGameName)
-				c.logger.Info("claude debug: - Tracker ActiveGamePath: '%s' -> '%s' (different ❌)", trk.ActiveGamePath, actualGameName)
-				c.logger.Info("claude debug: This indicates SAM loaded a new game but tracker path is stale")
-				return true
-			} else {
-				c.logger.Info("claude debug: ✅ CASE 1: Names and paths both match - no inconsistency")
-			}
-		} else {
-			c.logger.Info("claude debug: ⚠️ CASE 1: Names match but no valid .mra path to compare")
-		}
-	}
-
-	// ✅ CASE 2: Completely different games (SAM next command scenario)
-	c.logger.Info("claude debug: CASE 2 CHECK - different games scenario")
-	if !activeNameMatch && trk.ActiveGamePath != "" && strings.HasSuffix(strings.ToLower(trk.ActiveGamePath), ".mra") {
-		actualFileName := filepath.Base(trk.ActiveGamePath)
-		actualGameName := strings.TrimSuffix(actualFileName, ".mra")
-
-		c.logger.Info("claude debug: CASE 2 - Extracted path game name: '%s'", actualGameName)
-
-		// Check if SAM game is completely different from tracker path
-		pathMatch := strings.EqualFold(samGameName, actualGameName)
-		c.logger.Info("claude debug: CASE 2 - Path match check: %v", pathMatch)
-
-		if !pathMatch {
-			c.logger.Info("claude debug: 🔍 SAM/TRACKER INCONSISTENCY DETECTED (Type 2)")
-			c.logger.Info("claude debug: - SAM Game: '%s'", samGameName)
-			c.logger.Info("claude debug: - Tracker ActiveGameName: '%s' (different)", trk.ActiveGameName)
-			c.logger.Info("claude debug: - Tracker ActiveGamePath: '%s' -> '%s' (different)", trk.ActiveGamePath, actualGameName)
-			c.logger.Info("claude debug: This indicates SAM loaded a new game (via 'next' or auto-cycle) but tracker is stale")
-			return true
-		} else {
-			c.logger.Info("claude debug: ⚠️ CASE 2: Unexpectedly, SAM game matches path game")
-		}
-	} else {
-		c.logger.Info("claude debug: ⚠️ CASE 2: Conditions not met - activeNameMatch: %v, hasValidPath: %v",
-			!activeNameMatch,
-			trk.ActiveGamePath != "" && strings.HasSuffix(strings.ToLower(trk.ActiveGamePath), ".mra"))
-	}
-
-	c.logger.Info("claude debug: ❌ NO INCONSISTENCY DETECTED - proceeding with normal verification")
 	return false
 }
 
