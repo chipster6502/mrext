@@ -425,6 +425,13 @@ func (tr *Tracker) loadGame() {
 
 	path := mister.ResolvePath(activeGame)
 	filename := filepath.Base(path)
+
+	// Filter out .ini files - just return without processing
+	if strings.HasSuffix(strings.ToLower(filename), ".ini") {
+		tr.Logger.Info("🚫 SKIPPING .ini FILE - Configuration file, not a game: '%s'", filename)
+		return // Don't stop current game, just ignore this .ini file
+	}
+
 	name := utils.RemoveFileExt(filename)
 
 	if filepath.Ext(strings.ToLower(filename)) == ".mgl" {

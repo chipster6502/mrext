@@ -1,6 +1,7 @@
 package claude
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jung-kurt/gofpdf"
 	"github.com/wizzomafizzo/mrext/pkg/config"
 	"github.com/wizzomafizzo/mrext/pkg/games"
 	"github.com/wizzomafizzo/mrext/pkg/service"
@@ -839,7 +841,6 @@ func HandleUpdateConfig(logger *service.Logger, cfg *config.UserConfig) http.Han
 	}
 }
 
-// ✅ NEW: Export playlist in different formats
 func HandleExportPlaylist(logger *service.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		format := r.URL.Query().Get("format")
@@ -863,23 +864,31 @@ func HandleExportPlaylist(logger *service.Logger) http.HandlerFunc {
 			return
 		}
 
-		var content string
+		var content []byte
 		var contentType string
 		var filename string
 
 		switch format {
 		case "txt":
-			content = formatPlaylistTXT(request.Games, request.Theme)
+			textContent := formatPlaylistTXT(request.Games, request.Theme)
+			content = []byte(textContent)
 			contentType = "text/plain"
 			filename = fmt.Sprintf("playlist_%s.txt", sanitizeFilename(request.Theme))
-		case "m3u":
-			content = formatPlaylistM3U(request.Games, request.Theme)
-			contentType = "audio/x-mpegurl"
-			filename = fmt.Sprintf("playlist_%s.m3u", sanitizeFilename(request.Theme))
-		case "json":
-			content = formatPlaylistJSON(request.Games, request.Theme)
-			contentType = "application/json"
-			filename = fmt.Sprintf("playlist_%s.json", sanitizeFilename(request.Theme))
+		case "pdf":
+			pdfContent, err := formatPlaylistPDF(request.Games, request.Theme)
+			if err != nil {
+				logger.Error("claude playlist: failed to generate PDF: %s", err)
+				http.Error(w, "Failed to generate PDF", http.StatusInternalServerError)
+				return
+			}
+			content = pdfContent
+			contentType = "application/pdf"
+			filename = fmt.Sprintf("playlist_%s.pdf", sanitizeFilename(request.Theme))
+		case "sync":
+			syncContent := formatPlaylistSync(request.Games, request.Theme)
+			content = []byte(syncContent)
+			contentType = "text/plain"
+			filename = fmt.Sprintf("playlist_%s.sync", sanitizeFilename(request.Theme))
 		default:
 			http.Error(w, "Unsupported format", http.StatusBadRequest)
 			return
@@ -888,7 +897,7 @@ func HandleExportPlaylist(logger *service.Logger) http.HandlerFunc {
 		w.Header().Set("Content-Type", contentType)
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(content))
+		w.Write(content)
 
 		logger.Info("claude playlist: exported %d games as %s format", len(request.Games), format)
 	}
@@ -917,43 +926,6 @@ func formatPlaylistTXT(games []GameRecommendation, theme string) string {
 	}
 
 	return content.String()
-}
-
-// ✅ FORMAT: M3U format for playlist
-func formatPlaylistM3U(games []GameRecommendation, theme string) string {
-	var content strings.Builder
-
-	content.WriteString("#EXTM3U\n")
-	content.WriteString(fmt.Sprintf("#PLAYLIST:%s\n", theme))
-
-	for _, game := range games {
-		content.WriteString(fmt.Sprintf("#EXTINF:-1,%s - %s\n", game.Name, game.System))
-		if game.Path != "" {
-			content.WriteString(fmt.Sprintf("%s\n", game.Path))
-		} else {
-			content.WriteString(fmt.Sprintf("# %s\n", game.Name))
-		}
-	}
-
-	return content.String()
-}
-
-// ✅ FORMAT: JSON format for playlist
-func formatPlaylistJSON(games []GameRecommendation, theme string) string {
-	playlist := struct {
-		Theme     string               `json:"theme"`
-		Generated string               `json:"generated"`
-		Count     int                  `json:"count"`
-		Games     []GameRecommendation `json:"games"`
-	}{
-		Theme:     theme,
-		Generated: time.Now().Format(time.RFC3339),
-		Count:     len(games),
-		Games:     games,
-	}
-
-	data, _ := json.MarshalIndent(playlist, "", "  ")
-	return string(data)
 }
 
 // ✅ UTILITY: Sanitize filename
@@ -1146,4 +1118,199 @@ func HandleGetGameContext(logger *service.Logger, cfg *config.UserConfig, trk *t
 		logger.Info("claude game context: returned context for '%s' (%s) - SAM active for current game: %v",
 			gameContext.GameName, gameContext.SystemName, samActiveForCurrentGame)
 	}
+}
+
+// PDF format generator
+func formatPlaylistPDF(games []GameRecommendation, theme string) ([]byte, error) {
+	pdf := gofpdf.New("P", "mm", "A4", "")
+	pdf.AddPage()
+
+	// Set margins
+	pdf.SetMargins(20, 20, 20)
+
+	// Title
+	pdf.SetFont("Arial", "B", 18)
+	pdf.SetTextColor(0, 0, 0)
+	pdf.CellFormat(0, 15, fmt.Sprintf("Claude AI Playlist: %s", theme), "", 1, "C", false, 0, "")
+	pdf.Ln(5)
+
+	// Subtitle
+	pdf.SetFont("Arial", "", 12)
+	pdf.SetTextColor(100, 100, 100)
+	pdf.CellFormat(0, 8, fmt.Sprintf("Generated: %s | Games: %d", time.Now().Format("January 2, 2006 at 15:04"), len(games)), "", 1, "C", false, 0, "")
+	pdf.Ln(10)
+
+	// Games list
+	pdf.SetFont("Arial", "", 11)
+	pdf.SetTextColor(0, 0, 0)
+
+	for i, game := range games {
+		// Check if we need a new page
+		if pdf.GetY() > 250 {
+			pdf.AddPage()
+		}
+
+		// Game number and name
+		pdf.SetFont("Arial", "B", 12)
+		pdf.SetTextColor(50, 50, 150)
+		pdf.CellFormat(0, 8, fmt.Sprintf("%d. %s", i+1, game.Name), "", 1, "L", false, 0, "")
+
+		// System
+		pdf.SetFont("Arial", "", 10)
+		pdf.SetTextColor(100, 100, 100)
+		pdf.CellFormat(0, 6, fmt.Sprintf("System: %s", game.System), "", 1, "L", false, 0, "")
+
+		// Description (if available)
+		if game.Description != "" {
+			pdf.SetFont("Arial", "", 10)
+			pdf.SetTextColor(0, 0, 0)
+			pdf.SetX(25) // Indent
+
+			// Word wrap for long descriptions
+			lines := pdf.SplitLines([]byte(fmt.Sprintf("Description: %s", game.Description)), 160)
+			for _, line := range lines {
+				pdf.CellFormat(0, 5, string(line), "", 1, "L", false, 0, "")
+				pdf.SetX(25)
+			}
+		}
+
+		// Reason (if available)
+		if game.Reason != "" {
+			pdf.SetFont("Arial", "I", 10)
+			pdf.SetTextColor(0, 100, 0)
+			pdf.SetX(25) // Indent
+
+			// Word wrap for long reasons
+			lines := pdf.SplitLines([]byte(fmt.Sprintf("Why: %s", game.Reason)), 160)
+			for _, line := range lines {
+				pdf.CellFormat(0, 5, string(line), "", 1, "L", false, 0, "")
+				pdf.SetX(25)
+			}
+		}
+
+		// Path (if available)
+		if game.Path != "" {
+			pdf.SetFont("Arial", "", 8)
+			pdf.SetTextColor(150, 150, 150)
+			pdf.SetX(25) // Indent
+
+			// Truncate very long paths
+			path := game.Path
+			if len(path) > 80 {
+				path = "..." + path[len(path)-77:]
+			}
+			pdf.CellFormat(0, 4, fmt.Sprintf("Path: %s", path), "", 1, "L", false, 0, "")
+		}
+
+		pdf.Ln(3) // Space between games
+	}
+
+	// Footer
+	pdf.SetY(-20)
+	pdf.SetFont("Arial", "I", 8)
+	pdf.SetTextColor(150, 150, 150)
+	pdf.CellFormat(0, 10, "Generated by MiSTer Remote - Claude AI Playlist Generator", "", 0, "C", false, 0, "")
+
+	// Generate PDF bytes
+	var buf bytes.Buffer
+	err := pdf.Output(&buf)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate PDF: %w", err)
+	}
+
+	return buf.Bytes(), nil
+}
+
+// LaunchSync (.sync) format generator
+func formatPlaylistSync(games []GameRecommendation, theme string) string {
+	var content strings.Builder
+
+	// Header section
+	content.WriteString(fmt.Sprintf("name = Claude AI Playlist: %s\n", theme))
+	content.WriteString("author = Claude AI via Remote\n")
+	content.WriteString("url = \n") // Empty URL for local use
+	content.WriteString(fmt.Sprintf("updated = %s\n\n", time.Now().Format("2006-01-02")))
+
+	// Game sections
+	for _, game := range games {
+		content.WriteString(fmt.Sprintf("[%s]\n", game.Name))
+
+		// Map system names to LaunchSync format
+		systemName := mapSystemToLaunchSync(game.System)
+		content.WriteString(fmt.Sprintf("system = %s\n", systemName))
+
+		// Generate match patterns for better ROM finding
+		matches := generateMatchPatterns(game.Name)
+		for _, match := range matches {
+			content.WriteString(fmt.Sprintf("match = %s\n", match))
+		}
+
+		content.WriteString("\n")
+	}
+
+	return content.String()
+}
+
+// Map system names from Claude to LaunchSync format
+func mapSystemToLaunchSync(system string) string {
+	systemMap := map[string]string{
+		"Super Nintendo":     "SNES",
+		"Nintendo":           "NES",
+		"Sega Genesis":       "Genesis",
+		"Game Boy":           "Gameboy",
+		"Game Boy Color":     "GBC",
+		"Game Boy Advance":   "GBA",
+		"PlayStation":        "PSX",
+		"Arcade":             "Arcade",
+		"Neo Geo":            "NeoGeo",
+		"TurboGrafx-16":      "TGFX16",
+		"Sega Master System": "SMS",
+		"Atari 2600":         "Atari2600",
+		"Commodore 64":       "C64",
+		"Amiga":              "Amiga",
+	}
+
+	if mapped, exists := systemMap[system]; exists {
+		return mapped
+	}
+
+	// Default fallback - clean the system name
+	return strings.ReplaceAll(system, " ", "")
+}
+
+// Generate multiple match patterns for better ROM finding
+func generateMatchPatterns(gameName string) []string {
+	var patterns []string
+
+	// Exact match
+	patterns = append(patterns, gameName)
+
+	// Common region variations
+	variations := []string{
+		gameName + " (USA)",
+		gameName + " (World)",
+		gameName + " (Europe)",
+		gameName + " (Japan)",
+		gameName + " (U)",
+		gameName + " (W)",
+		gameName + " (E)",
+		gameName + " (J)",
+	}
+
+	patterns = append(patterns, variations...)
+
+	// Remove special characters for fuzzy matching
+	cleanName := strings.ReplaceAll(gameName, ":", "")
+	cleanName = strings.ReplaceAll(cleanName, "'", "")
+	if cleanName != gameName {
+		patterns = append(patterns, cleanName)
+		patterns = append(patterns, cleanName+" (USA)")
+	}
+
+	// Regex pattern for broader matching (prefix with ~)
+	if len(gameName) > 5 {
+		patterns = append(patterns, fmt.Sprintf("~^%s", regexp.QuoteMeta(gameName)))
+	}
+
+	return patterns
 }
