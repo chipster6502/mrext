@@ -473,6 +473,15 @@ func (c *Client) buildGameContext(trk *tracker.Tracker) *GameContext {
 		ext := strings.ToLower(filepath.Ext(context.GamePath))
 		hasExtension := ext != ""
 
+		// ✅ NEW: Skip all .ini files - they are configuration files, not games
+		if ext == ".ini" {
+			c.logger.Info("claude debug: 🚫 SKIPPING .ini FILE - Configuration file, not a game: '%s'", context.GamePath)
+			// Clear the game context since this isn't a real game
+			context.GamePath = ""
+			context.GameName = ""
+			return context
+		}
+
 		if hasExtension {
 			c.logger.Info("claude debug: 🎯 EXECUTING FILE METHOD (valid file path)")
 
