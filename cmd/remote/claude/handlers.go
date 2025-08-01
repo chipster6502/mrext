@@ -198,7 +198,7 @@ func HandlePlaylist(logger *service.Logger, cfg *config.UserConfig, trk *tracker
 		logger.Info("claude playlist: generating %d games for theme '%s' from systems: %v",
 			request.GameCount, request.Theme, request.Systems)
 
-		// ✅ FAST: Get games with aggressive timeout (max 8 seconds for scanning)
+		// Get games with aggressive timeout (max 8 seconds for scanning)
 		scanTimeout := 8 * time.Second
 		installedGames, err := getInstalledGamesFast(cfg, logger, request.Systems, scanTimeout)
 		if err != nil {
@@ -212,7 +212,7 @@ func HandlePlaylist(logger *service.Logger, cfg *config.UserConfig, trk *tracker
 			return
 		}
 
-		// ✅ SMART FILTERING: Reduce dataset for Claude (max 50 games)
+		// Reduce dataset for Claude (max 50 games)
 		maxGamesForClaude := 50
 		filteredGames := smartFilterGames(installedGames, request.Theme, maxGamesForClaude)
 
@@ -248,11 +248,11 @@ func HandlePlaylist(logger *service.Logger, cfg *config.UserConfig, trk *tracker
 			return
 		}
 
-		// ✅ Add metadata for export functionality
+		// Add metadata for export functionality
 		if response.Error == "" {
 			for i := range response.Games {
 				response.Games[i].GeneratedAt = time.Now()
-				response.Games[i].Theme = request.Theme
+				response.Games[i].Theme = response.Theme
 			}
 		}
 
@@ -841,7 +841,7 @@ func HandleUpdateConfig(logger *service.Logger, cfg *config.UserConfig) http.Han
 	}
 }
 
-func HandleExportPlaylist(logger *service.Logger) http.HandlerFunc {
+func HandleExportPlaylist(logger *service.Logger, cfg *config.UserConfig, trk *tracker.Tracker) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		format := r.URL.Query().Get("format")
 		if format == "" {
@@ -864,18 +864,57 @@ func HandleExportPlaylist(logger *service.Logger) http.HandlerFunc {
 			return
 		}
 
+		// ✅ DEBUG: Log the incoming theme
+		logger.Info("=== EXPORT DEBUG ===")
+		logger.Info("Received theme: '%s'", request.Theme)
+		logger.Info("Format: '%s'", format)
+
+		// ✅ DEBUG: Check if theme is detected as active game keyword
+		isActiveKeyword := isActiveGameThemeKeyword(request.Theme)
+		logger.Info("isActiveGameThemeKeyword result: %v", isActiveKeyword)
+
+		// ✅ NEW: Get active game info if this is an active game-based playlist
+		var activeGameName string
+		if isActiveKeyword {
+			logger.Info("Theme detected as active game keyword - getting game context")
+			client := NewClient(&cfg.Claude, logger)
+			gameContext := client.buildGameContext(trk)
+
+			// ✅ DEBUG: Log game context details
+			logger.Info("Game context - GameName: '%s', SystemName: '%s', CoreName: '%s'",
+				gameContext.GameName, gameContext.SystemName, gameContext.CoreName)
+
+			if gameContext.GameName != "" {
+				activeGameName = gameContext.GameName
+				logger.Info("Active game name set to: '%s'", activeGameName)
+			} else {
+				logger.Info("WARNING: Game context has empty GameName")
+			}
+		} else {
+			logger.Info("Theme NOT detected as active game keyword")
+		}
+
 		var content []byte
 		var contentType string
 		var filename string
 
+		// ✅ NEW: Generate custom filename based on active game
+		filenameTheme := request.Theme
+		if activeGameName != "" && isActiveKeyword {
+			filenameTheme = fmt.Sprintf("Similar games to %s", activeGameName)
+			logger.Info("Custom filename theme: '%s'", filenameTheme)
+		} else {
+			logger.Info("Using original theme for filename: '%s'", filenameTheme)
+		}
+
 		switch format {
 		case "txt":
-			textContent := formatPlaylistTXT(request.Games, request.Theme)
+			textContent := formatPlaylistTXT(request.Games, request.Theme, activeGameName)
 			content = []byte(textContent)
 			contentType = "text/plain"
-			filename = fmt.Sprintf("playlist_%s.txt", sanitizeFilename(request.Theme))
+			filename = fmt.Sprintf("playlist_%s.txt", sanitizeFilename(filenameTheme))
 		case "pdf":
-			pdfContent, err := formatPlaylistPDF(request.Games, request.Theme)
+			pdfContent, err := formatPlaylistPDF(request.Games, request.Theme, activeGameName)
 			if err != nil {
 				logger.Error("claude playlist: failed to generate PDF: %s", err)
 				http.Error(w, "Failed to generate PDF", http.StatusInternalServerError)
@@ -883,31 +922,41 @@ func HandleExportPlaylist(logger *service.Logger) http.HandlerFunc {
 			}
 			content = pdfContent
 			contentType = "application/pdf"
-			filename = fmt.Sprintf("playlist_%s.pdf", sanitizeFilename(request.Theme))
+			filename = fmt.Sprintf("playlist_%s.pdf", sanitizeFilename(filenameTheme))
 		case "sync":
-			syncContent := formatPlaylistSync(request.Games, request.Theme)
+			syncContent := formatPlaylistSync(request.Games, request.Theme, activeGameName)
 			content = []byte(syncContent)
 			contentType = "text/plain"
-			filename = fmt.Sprintf("playlist_%s.sync", sanitizeFilename(request.Theme))
+			filename = fmt.Sprintf("playlist_%s.sync", sanitizeFilename(filenameTheme))
 		default:
 			http.Error(w, "Unsupported format", http.StatusBadRequest)
 			return
 		}
+
+		// ✅ DEBUG: Log final filename
+		logger.Info("Final filename: '%s'", filename)
+		logger.Info("===================")
 
 		w.Header().Set("Content-Type", contentType)
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
 		w.WriteHeader(http.StatusOK)
 		w.Write(content)
 
-		logger.Info("claude playlist: exported %d games as %s format", len(request.Games), format)
+		logger.Info("claude playlist: exported %d games as %s format with filename: %s", len(request.Games), format, filename)
 	}
 }
 
 // ✅ FORMAT: TXT format for playlist
-func formatPlaylistTXT(games []GameRecommendation, theme string) string {
+func formatPlaylistTXT(games []GameRecommendation, theme string, activeGameName string) string {
 	var content strings.Builder
 
-	content.WriteString(fmt.Sprintf("# Claude AI Playlist: %s\n", theme))
+	// ✅ Enhanced title for active game playlists
+	title := theme
+	if activeGameName != "" && isActiveGameThemeKeyword(theme) {
+		title = fmt.Sprintf("Games similar to %s", activeGameName)
+	}
+
+	content.WriteString(fmt.Sprintf("# Claude AI Playlist: %s\n", title))
 	content.WriteString(fmt.Sprintf("# Generated: %s\n", time.Now().Format("2006-01-02 15:04:05")))
 	content.WriteString(fmt.Sprintf("# Games: %d\n\n", len(games)))
 
@@ -988,6 +1037,7 @@ func isActiveGameThemeKeyword(theme string) bool {
 		"like active game",
 		"playlist based in active game", // User's specific example
 		"playlist based on active game",
+		"games similar to", // This covers "Games similar to [game name]"
 	}
 
 	for _, keyword := range keywords {
@@ -1121,17 +1171,37 @@ func HandleGetGameContext(logger *service.Logger, cfg *config.UserConfig, trk *t
 }
 
 // PDF format generator
-func formatPlaylistPDF(games []GameRecommendation, theme string) ([]byte, error) {
+func formatPlaylistPDF(games []GameRecommendation, theme string, activeGameName string) ([]byte, error) {
 	pdf := gofpdf.New("P", "mm", "A4", "")
 	pdf.AddPage()
 
-	// Set margins
-	pdf.SetMargins(20, 20, 20)
+	// Set larger margins to prevent text truncation
+	pdf.SetMargins(25, 25, 25) // Increased from 20 to 25
 
-	// Title
-	pdf.SetFont("Arial", "B", 18)
+	// Enhanced title for active game playlists
+	title := theme
+	if activeGameName != "" && isActiveGameThemeKeyword(theme) {
+		title = fmt.Sprintf("Games similar to %s", activeGameName)
+	}
+
+	// Use smaller font size and check title length
+	pdf.SetFont("Arial", "B", 16) // Reduced from 18 to 16
 	pdf.SetTextColor(0, 0, 0)
-	pdf.CellFormat(0, 15, fmt.Sprintf("Claude AI Playlist: %s", theme), "", 1, "C", false, 0, "")
+
+	// Split long titles into multiple lines if needed
+	fullTitle := fmt.Sprintf("Claude AI Playlist: %s", title)
+
+	// Check if title is too long (more than 60 characters)
+	if len(fullTitle) > 60 {
+		// Split into two lines
+		pdf.CellFormat(0, 8, "Claude AI Playlist:", "", 1, "C", false, 0, "")
+		pdf.SetFont("Arial", "B", 14) // Slightly smaller for subtitle
+		pdf.CellFormat(0, 8, title, "", 1, "C", false, 0, "")
+	} else {
+		// Single line title
+		pdf.CellFormat(0, 10, fullTitle, "", 1, "C", false, 0, "")
+	}
+
 	pdf.Ln(5)
 
 	// Subtitle
@@ -1222,11 +1292,17 @@ func formatPlaylistPDF(games []GameRecommendation, theme string) ([]byte, error)
 }
 
 // LaunchSync (.sync) format generator
-func formatPlaylistSync(games []GameRecommendation, theme string) string {
+func formatPlaylistSync(games []GameRecommendation, theme string, activeGameName string) string {
 	var content strings.Builder
 
+	// Enhanced name for active game playlists
+	name := theme
+	if activeGameName != "" && isActiveGameThemeKeyword(theme) {
+		name = fmt.Sprintf("Games similar to %s", activeGameName)
+	}
+
 	// Header section
-	content.WriteString(fmt.Sprintf("name = Claude AI Playlist: %s\n", theme))
+	content.WriteString(fmt.Sprintf("name = Claude AI Playlist: %s\n", name))
 	content.WriteString("author = Claude AI via Remote\n")
 	content.WriteString("url = \n") // Empty URL for local use
 	content.WriteString(fmt.Sprintf("updated = %s\n\n", time.Now().Format("2006-01-02")))
@@ -1239,8 +1315,8 @@ func formatPlaylistSync(games []GameRecommendation, theme string) string {
 		systemName := mapSystemToLaunchSync(game.System)
 		content.WriteString(fmt.Sprintf("system = %s\n", systemName))
 
-		// Generate match patterns for better ROM finding
-		matches := generateMatchPatterns(game.Name)
+		// Generate match patterns using exact file names
+		matches := generateMatchPatterns(game)
 		for _, match := range matches {
 			content.WriteString(fmt.Sprintf("match = %s\n", match))
 		}
@@ -1253,63 +1329,121 @@ func formatPlaylistSync(games []GameRecommendation, theme string) string {
 
 // Map system names from Claude to LaunchSync format
 func mapSystemToLaunchSync(system string) string {
+	// Normalize input for case-insensitive matching
+	systemLower := strings.ToLower(strings.TrimSpace(system))
+
+	// Comprehensive system mapping
 	systemMap := map[string]string{
-		"Super Nintendo":     "SNES",
-		"Nintendo":           "NES",
-		"Sega Genesis":       "Genesis",
-		"Game Boy":           "Gameboy",
-		"Game Boy Color":     "GBC",
-		"Game Boy Advance":   "GBA",
-		"PlayStation":        "PSX",
-		"Arcade":             "Arcade",
-		"Neo Geo":            "NeoGeo",
-		"TurboGrafx-16":      "TGFX16",
-		"Sega Master System": "SMS",
-		"Atari 2600":         "Atari2600",
-		"Commodore 64":       "C64",
-		"Amiga":              "Amiga",
+		// Nintendo Systems
+		"nintendo":       "NES",
+		"nes":            "NES",
+		"super nintendo": "SNES",
+		"snes":           "SNES",
+		"nintendo 64":    "Nintendo64",
+		"n64":            "Nintendo64",
+
+		// Game Boy Family
+		"game boy":         "Gameboy",
+		"gameboy":          "Gameboy",
+		"game boy color":   "GameboyColor",
+		"gameboy color":    "GameboyColor",
+		"game boy advance": "GBA",
+		"gameboy advance":  "GBA",
+		"gba":              "GBA",
+
+		// Sega Systems
+		"sega genesis":       "Genesis",
+		"genesis":            "Genesis",
+		"mega drive":         "Genesis",
+		"sega master system": "MasterSystem",
+		"master system":      "MasterSystem",
+		"game gear":          "GameGear",
+		"sega cd":            "MegaCD",
+		"saturn":             "Saturn",
+
+		// Sony Systems
+		"playstation": "PSX",
+		"psx":         "PSX",
+
+		// NEC Systems
+		"turbografx-16": "TurboGrafx16",
+		"turbografx 16": "TurboGrafx16",
+		"pc engine":     "TurboGrafx16",
+
+		// SNK Systems
+		"neo geo": "NeoGeo",
+		"neogeo":  "NeoGeo",
+
+		// Atari Systems
+		"atari 2600": "Atari2600",
+		"atari 7800": "Atari7800",
+		"atari lynx": "AtariLynx",
+
+		// Computer Systems
+		"commodore 64": "C64",
+		"c64":          "C64",
+		"amiga":        "Amiga",
+		"msx":          "MSX",
+		"zx spectrum":  "ZXSpectrum",
+
+		// Arcade
+		"arcade": "Arcade",
+
+		// Other Consoles
+		"colecovision":  "ColecoVision",
+		"intellivision": "Intellivision",
+		"vectrex":       "Vectrex",
+		"jaguar":        "Jaguar",
 	}
 
-	if mapped, exists := systemMap[system]; exists {
+	// Try exact match first
+	if mapped, exists := systemMap[systemLower]; exists {
 		return mapped
 	}
 
 	// Default fallback - clean the system name
-	return strings.ReplaceAll(system, " ", "")
+	cleaned := strings.ReplaceAll(system, " ", "")
+	if len(cleaned) > 0 {
+		return strings.ToUpper(cleaned[:1]) + cleaned[1:]
+	}
+
+	return system
 }
 
-// Generate multiple match patterns for better ROM finding
-func generateMatchPatterns(gameName string) []string {
+func generateMatchPatterns(game GameRecommendation) []string {
 	var patterns []string
 
-	// Exact match
-	patterns = append(patterns, gameName)
+	// ✅ PRIMARY: Use exact filename from path (without extension)
+	if game.Path != "" {
+		// Extract filename from full path
+		filename := filepath.Base(game.Path)
 
-	// Common region variations
-	variations := []string{
-		gameName + " (USA)",
-		gameName + " (World)",
-		gameName + " (Europe)",
-		gameName + " (Japan)",
-		gameName + " (U)",
-		gameName + " (W)",
-		gameName + " (E)",
-		gameName + " (J)",
-	}
+		// Remove extension to get exact ROM name
+		nameWithoutExt := strings.TrimSuffix(filename, filepath.Ext(filename))
 
-	patterns = append(patterns, variations...)
+		// This is the EXACT match that LaunchSync needs
+		patterns = append(patterns, nameWithoutExt)
 
-	// Remove special characters for fuzzy matching
-	cleanName := strings.ReplaceAll(gameName, ":", "")
-	cleanName = strings.ReplaceAll(cleanName, "'", "")
-	if cleanName != gameName {
-		patterns = append(patterns, cleanName)
-		patterns = append(patterns, cleanName+" (USA)")
-	}
+		// ✅ SECONDARY: Add regex pattern for fuzzy matching if needed
+		if len(nameWithoutExt) > 5 {
+			patterns = append(patterns, fmt.Sprintf("~^%s", regexp.QuoteMeta(nameWithoutExt)))
+		}
+	} else {
+		// ✅ FALLBACK: If no path available, use game name as-is
+		patterns = append(patterns, game.Name)
 
-	// Regex pattern for broader matching (prefix with ~)
-	if len(gameName) > 5 {
-		patterns = append(patterns, fmt.Sprintf("~^%s", regexp.QuoteMeta(gameName)))
+		// Add basic region variants only as fallback
+		commonVariants := []string{
+			game.Name + " (USA)",
+			game.Name + " (World)",
+			game.Name + " (Europe)",
+		}
+		patterns = append(patterns, commonVariants...)
+
+		// Add regex pattern for broader matching
+		if len(game.Name) > 5 {
+			patterns = append(patterns, fmt.Sprintf("~^%s", regexp.QuoteMeta(game.Name)))
+		}
 	}
 
 	return patterns

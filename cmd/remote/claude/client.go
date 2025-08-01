@@ -1199,15 +1199,15 @@ func (c *Client) GeneratePlaylistFromActiveGame(ctx context.Context, request *Pl
 	// Parse and validate game recommendations
 	games := c.parseGameRecommendations(response.Content, request.GameCount, request.InstalledGames)
 
-	// Set theme to reflect active game context
-	finalTheme := request.Theme
-	if finalTheme == "" {
-		finalTheme = fmt.Sprintf("Games similar to %s", gameContext.GameName)
-	}
+	// ✅ CRITICAL FIX: Set theme to reflect active game context with actual game name
+	finalTheme := fmt.Sprintf("Games similar to %s", gameContext.GameName)
+
+	// ✅ DEBUG: Log the theme being returned
+	c.logger.Info("GeneratePlaylistFromActiveGame: Returning theme '%s' for game '%s'", finalTheme, gameContext.GameName)
 
 	return &PlaylistResponse{
 		Games:     games,
-		Theme:     finalTheme,
+		Theme:     finalTheme, // ✅ Use the updated theme with game name
 		Timestamp: time.Now(),
 	}, nil
 }
