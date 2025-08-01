@@ -365,7 +365,7 @@ func getInstalledGamesFast(cfg *config.UserConfig, logger *service.Logger, syste
 				installedGames = append(installedGames, InstalledGame{
 					Name:   gameName,
 					Path:   file,
-					System: system.Name,
+					System: system.Id,
 				})
 				systemGameCount++
 			}
@@ -516,7 +516,7 @@ func buildGameCacheFast(cfg *config.UserConfig, logger *service.Logger, systemId
 				installedGames = append(installedGames, InstalledGame{
 					Name:   gameName,
 					Path:   file,
-					System: system.Name,
+					System: system.Id,
 				})
 				systemGameCount++
 			}
@@ -1329,83 +1329,24 @@ func formatPlaylistSync(games []GameRecommendation, theme string, activeGameName
 
 // Map system names from Claude to LaunchSync format
 func mapSystemToLaunchSync(system string) string {
-	// Normalize input for case-insensitive matching
-	systemLower := strings.ToLower(strings.TrimSpace(system))
+	// SystemName from game context is already the correct core ID
+	// The SystemName comes from inferSystemFromPath() which extracts the folder name
+	// This is exactly what LaunchSync expects, so use it directly without any mapping
 
-	// Comprehensive system mapping
-	systemMap := map[string]string{
-		// Nintendo Systems
-		"nintendo":       "NES",
-		"nes":            "NES",
-		"super nintendo": "SNES",
-		"snes":           "SNES",
-		"nintendo 64":    "Nintendo64",
-		"n64":            "Nintendo64",
+	// Clean up any whitespace
+	system = strings.TrimSpace(system)
 
-		// Game Boy Family
-		"game boy":         "Gameboy",
-		"gameboy":          "Gameboy",
-		"game boy color":   "GameboyColor",
-		"gameboy color":    "GameboyColor",
-		"game boy advance": "GBA",
-		"gameboy advance":  "GBA",
-		"gba":              "GBA",
-
-		// Sega Systems
-		"sega genesis":       "Genesis",
-		"genesis":            "Genesis",
-		"mega drive":         "Genesis",
-		"sega master system": "MasterSystem",
-		"master system":      "MasterSystem",
-		"game gear":          "GameGear",
-		"sega cd":            "MegaCD",
-		"saturn":             "Saturn",
-
-		// Sony Systems
-		"playstation": "PSX",
-		"psx":         "PSX",
-
-		// NEC Systems
-		"turbografx-16": "TurboGrafx16",
-		"turbografx 16": "TurboGrafx16",
-		"pc engine":     "TurboGrafx16",
-
-		// SNK Systems
-		"neo geo": "NeoGeo",
-		"neogeo":  "NeoGeo",
-
-		// Atari Systems
-		"atari 2600": "Atari2600",
-		"atari 7800": "Atari7800",
-		"atari lynx": "AtariLynx",
-
-		// Computer Systems
-		"commodore 64": "C64",
-		"c64":          "C64",
-		"amiga":        "Amiga",
-		"msx":          "MSX",
-		"zx spectrum":  "ZXSpectrum",
-
-		// Arcade
-		"arcade": "Arcade",
-
-		// Other Consoles
-		"colecovision":  "ColecoVision",
-		"intellivision": "Intellivision",
-		"vectrex":       "Vectrex",
-		"jaguar":        "Jaguar",
+	// If the system is empty, return as-is
+	if system == "" {
+		return system
 	}
 
-	// Try exact match first
-	if mapped, exists := systemMap[systemLower]; exists {
-		return mapped
-	}
-
-	// Default fallback - clean the system name
-	cleaned := strings.ReplaceAll(system, " ", "")
-	if len(cleaned) > 0 {
-		return strings.ToUpper(cleaned[:1]) + cleaned[1:]
-	}
+	// The SystemName is already the correct core ID
+	// Examples:
+	// - "NEOGEO" stays "NEOGEO"
+	// - "NES" stays "NES"
+	// - "Genesis" stays "Genesis"
+	// - "Arcade" stays "Arcade"
 
 	return system
 }
