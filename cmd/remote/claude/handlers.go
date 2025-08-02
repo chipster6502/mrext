@@ -1134,7 +1134,7 @@ func HandleGetGameContext(logger *service.Logger, cfg *config.UserConfig, trk *t
 		// Build game context with Claude processing
 		gameContext := client.buildGameContext(trk)
 
-		// ✅ IMPROVED: Determine if SAM is actively running the current game
+		// Determine if SAM is actively running the current game
 		samActiveForCurrentGame := false
 		if client.isSAMActive() {
 			samGameName, samSystemName, err := client.parseSAMGameInfo()
@@ -1143,11 +1143,16 @@ func HandleGetGameContext(logger *service.Logger, cfg *config.UserConfig, trk *t
 			}
 		}
 
+		// Apply display name mapping for Game Info visualization ONLY
+		// This converts internal system IDs (like "NeoGeo") to user-friendly names
+		// (like "SNK Neo Geo AES & MVS") for better display in the UI
+		displaySystemName := mapSystemToDisplayName(gameContext.SystemName)
+
 		// Prepare response with clean data + accurate sam_active flag
 		response := map[string]interface{}{
 			"core_name":    gameContext.CoreName,
 			"game_name":    gameContext.GameName,
-			"system_name":  gameContext.SystemName,
+			"system_name":  displaySystemName, // ✅ CRITICAL: Use display name for UI
 			"game_path":    gameContext.GamePath,
 			"last_started": gameContext.LastStarted,
 			"sam_active":   samActiveForCurrentGame, // ✅ IMPROVED: Only true if SAM is running current game
@@ -1165,8 +1170,9 @@ func HandleGetGameContext(logger *service.Logger, cfg *config.UserConfig, trk *t
 			return
 		}
 
-		logger.Info("claude game context: returned context for '%s' (%s) - SAM active for current game: %v",
-			gameContext.GameName, gameContext.SystemName, samActiveForCurrentGame)
+		// LOG: Show both internal and display names for debugging
+		logger.Info("claude game context: returned context - Game: '%s', Internal System: '%s', Display System: '%s'",
+			gameContext.GameName, gameContext.SystemName, displaySystemName)
 	}
 }
 
@@ -1388,4 +1394,188 @@ func generateMatchPatterns(game GameRecommendation) []string {
 	}
 
 	return patterns
+}
+
+// mapSystemToDisplayName converts internal system IDs to user-friendly display names
+// based on the official MiSTer documentation pages and actual system folders
+func mapSystemToDisplayName(systemID string) string {
+	// System display name mapping based on:
+	// https://mister-devel.github.io/MkDocs_MiSTer/cores/console/
+	// https://mister-devel.github.io/MkDocs_MiSTer/cores/computer/
+	// + actual system folders found in user's MiSTer
+	displayNameMap := map[string]string{
+		// Console Systems
+		"S32X":               "Sega 32X",
+		"AY-3-8500":          "\"Pong-on-a-chip\"",
+		"AVision":            "Entex Adventure Vision",
+		"Arcadia":            "Emerson Arcadia 2001",
+		"Astrocade":          "Bally Astrocade",
+		"Atari2600":          "Atari 2600",
+		"Atari5200":          "Atari 5200 SuperSystem",
+		"ATARI5200":          "Atari 5200 SuperSystem", // Alt capitalization
+		"Atari7800":          "Atari 7800 ProSystem / Atari 2600",
+		"ATARI7800":          "Atari 7800 ProSystem / Atari 2600", // Alt capitalization
+		"AtariLynx":          "Atari Lynx",
+		"BBCBridgeCompanion": "BBC Bridge Companion",
+		"Casio_PV-1000":      "Casio PV-1000",
+		"ChannelF":           "Fairchild Channel F",
+		"ColecoVision":       "ColecoVision / Sega SG-1000",
+		"Coleco":             "ColecoVision",
+		"CreatiVision":       "VTech CreatiVision / Dick Smith Wizzard",
+		"Gamate":             "Bit Corp Gamate",
+		"GBA":                "Nintendo Game Boy Advance",
+		"GBA2P":              "2x Game Boy Advance (2-Player)",
+		"GameBoy":            "Nintendo Game Boy",
+		"GAMEBOY":            "Nintendo Game Boy", // Alt capitalization
+		"GBC":                "Nintendo Game Boy Color",
+		"Gameboy2P":          "2x Game Boy (2-Player)",
+		"GAMEBOY2P":          "2x Game Boy (2-Player)", // Alt capitalization
+		"GameGear":           "Sega Game Gear",
+		"GameNWatch":         "Nintendo Game & Watch Handheld Devices",
+		"Intv":               "Mattel Intellivision",
+		"Intellivision":      "Mattel Intellivision",
+		"MyVision":           "Nichibutsu My Vision",
+		"MegaCD":             "Sega CD / Sega Mega-CD",
+		"MegaDrive":          "Sega Mega Drive / Sega Genesis",
+		"Genesis":            "Sega Mega Drive / Sega Genesis", // Alternative name
+		"MegaDuck":           "Watara Mega Duck",
+		"N64":                "Nintendo 64",
+		"NES":                "Nintendo Entertainment System / Famicom Disk System / NSF Music Player",
+		"FDS":                "Nintendo Famicom Disk System",
+		"NeoGeo":             "SNK Neo Geo AES & MVS",
+		"NEOGEO":             "SNK Neo Geo AES & MVS", // Alt capitalization
+		"NeoGeo-CD":          "SNK Neo Geo CD",
+		"NeoGeoPocket":       "SNK Neo Geo Pocket / Neo Geo Pocket Color",
+		"Odyssey2":           "Magnavox Odyssey 2 / Philips Odyssey 2 / Philips Videopac G7000",
+		"ODYSSEY2":           "Magnavox Odyssey 2 / Philips Odyssey 2 / Philips Videopac G7000", // Alt capitalization
+		"PokemonMini":        "Pokémon Mini",
+		"PSX":                "Sony Playstation",
+		"Saturn":             "Sega Saturn",
+		"SGB":                "Nintendo Super Game Boy and Super Game Boy 2",
+		"SG1000":             "Sega SG-1000",
+		"SG-1000":            "Sega SG-1000",
+		"SMS":                "Sega Master System / Sega Game Gear / Sega SG-1000",
+		"SNES":               "Super Nintendo Entertainment System / Nintendo Satellaview / SPC Music Player",
+		"SuperGrafx":         "NEC SuperGrafx",
+		"Super_Vision_8000":  "Bandai Super Vision 8000",
+		"SuperVision8000":    "Bandai Super Vision 8000", // Alt format
+		"SuperVision":        "Watara SuperVision",
+		"TurboGrafx16":       "NEC TurboGrafx-16 / PC Engine / CD-ROM² / Super CD-ROM² / Duo / TurboDuo / SuperGrafx / Arcade Card",
+		"TGFX16":             "NEC TurboGrafx-16 / PC Engine / CD-ROM² / Super CD-ROM² / Duo / TurboDuo / SuperGrafx / Arcade Card", // Alternative name
+		"TGFX16-CD":          "NEC TurboGrafx-16 CD / PC Engine CD",
+		"VC4000":             "Interton VC4000 / Acetronic MPU-1000 / Occitane OC2000",
+		"Vectrex":            "Vectrex",
+		"VECTREX":            "Vectrex", // Alt capitalization
+		"WonderSwan":         "Bandai WonderSwan / WonderSwan Color / SwanCrystal",
+		"WonderSwanColor":    "Bandai WonderSwan Color",
+		"PocketChallengeV2":  "Benesse Pocket Challenge V2",
+		"EpochGalaxyII":      "Epoch Galaxy II",
+		"CD-i":               "Philips CD-i",
+		"SCV":                "Epoch Super Cassette Vision",
+
+		// Computer Systems
+		"AcornAtom":      "Acorn Atom",
+		"AcornElectron":  "Acorn Electron",
+		"Adam":           "Coleco Adam",
+		"ColecoAdam":     "Coleco Adam", // Alternative
+		"AliceMC10":      "Matra & Hachette Ordinateur Alice (TRS-80 MC-10 Clone)",
+		"Altair8800":     "MITS Altair 8800",
+		"AmstradPCW":     "Amstrad PCW",
+		"Amstrad PCW":    "Amstrad PCW", // Alt format with space
+		"Amstrad":        "Amstrad CPC 6128",
+		"ao486":          "486DX33 (No FPU) compatible",
+		"AO486":          "486DX33 (No FPU) compatible", // Alternative name
+		"Apogee":         "Apogee BK-01 / Radio-86RK",
+		"APOGEE":         "Apogee BK-01 / Radio-86RK", // Alt capitalization
+		"Apple-II":       "Apple IIe",
+		"Apple-I":        "Apple I",
+		"APPLE-I":        "Apple I", // Alt capitalization
+		"Aquarius":       "Mattel Aquarius",
+		"AQUARIUS":       "Mattel Aquarius", // Alt capitalization
+		"Archie":         "Acorn Archimedes",
+		"ARCHIE":         "Acorn Archimedes", // Alt capitalization
+		"Atari800":       "Atari 800 / 800XL / 65XE / 130XE",
+		"ATARI800":       "Atari 800 / 800XL / 65XE / 130XE", // Alt capitalization
+		"AtariST":        "Atari ST / STe",
+		"BBCMicro":       "BBC Micro B / Master 128K",
+		"BK0011M":        "Elektronika BK (BK-0011M CPU)",
+		"C16":            "Commodore C16 / Plus/4",
+		"C64":            "Commodore 64 / Games System / 128",
+		"C128":           "Commodore 128",
+		"Casio_PV-2000":  "Casio PV-2000",
+		"Chip8":          "CHIP-8 by Joseph Weisbecker",
+		"CoCo2":          "Tandy Color Computer 2 / Dragon 32",
+		"CoCo3":          "Tandy Color Computer 3",
+		"COCO3":          "Tandy Color Computer 3", // Alt capitalization
+		"EDSAC":          "EDSAC",
+		"EG2000":         "EACA EG2000 Colour Genie",
+		"eg2000":         "EACA EG2000 Colour Genie", // Alt capitalization
+		"Galaksija":      "Galaksija by Voja Antonić",
+		"Homelab":        "Compukit Homelab",
+		"Interact":       "Interact Home Computer",
+		"Jupiter":        "Jupiter Ace",
+		"Laser":          "Vtech Laser 310",
+		"Laser310":       "Vtech Laser 310",
+		"Lynx48":         "Camputers Lynx 48k, 96k",
+		"MacPlus":        "Macintosh Plus",
+		"MACPLUS":        "Macintosh Plus", // Alt capitalization
+		"Minimig-AGA":    "Commodore Amiga 500 / 600 / 1200 / 4000 / CD32",
+		"Amiga":          "Commodore Amiga 500 / 600 / 1200 / 4000 / CD32", // Common reference
+		"MSX1":           "Microsoft MSX1",
+		"MSX":            "Microsoft MSX / MSX2 / Plus / MSX3 / TurboR",
+		"MultiComp":      "Grant Searle's MultiComp",
+		"OndraSPO186":    "Tesla Ondra SPO-186",
+		"Ondra_SPO186":   "Tesla Ondra SPO-186", // Alt format
+		"Orao":           "PEL Varaždin Orao / Eagle",
+		"ORAO":           "PEL Varaždin Orao / Eagle", // Alt capitalization
+		"Oric":           "Tangerine Oric / Oric-1",
+		"PCXT":           "IBM PC/XT",
+		"PC88":           "NEC PC8801 MKII SR",
+		"PC8801":         "NEC PC8801 MKII SR", // Alt name
+		"PDP1":           "DEC PDP-1",
+		"PET2001":        "Commodore PET 2001",
+		"PMD85":          "Tesla PMD 85",
+		"QL":             "Sinclair QL",
+		"RX-78":          "Bandai RX-78",
+		"RX78":           "Bandai RX-78", // Alt format
+		"SAM-Coupe":      "Miles Gordon Technology SAM Coupé",
+		"SAMCOUPE":       "Miles Gordon Technology SAM Coupé", // Alt format
+		"SharpMZ":        "Sharp MZ",
+		"SordM5":         "Sord M5",
+		"Sord M5":        "Sord M5", // Alt format with space
+		"Specialist":     "Specialist / Специалист",
+		"SPMX":           "Specialist / Специалист", // Alt name
+		"SVI328":         "Spectravideo SV-328",
+		"TatungEinstein": "Tatung Einstein TC01 & 256",
+		"TI-99_4A":       "Texas Instruments TI-99/4A",
+		"TomyTutor":      "Tomy Tutor, Pyuta, and Pyuta Jr.",
+		"TomyScramble":   "Tomy Tutor Scramble",
+		"TRS-80":         "Radio Shack / Tandy TRS-80 Micro Computer System / Model I",
+		"TSConf":         "TSConf (ZX-Evolution Improvement)",
+		"UK101":          "Compukit UK101",
+		"Vector-06C":     "Vector-06C / Вектор-06Ц",
+		"VECTOR06":       "Vector-06C / Вектор-06Ц", // Alt format
+		"VIC20":          "Commodore VIC-20",
+		"VT52":           "DEC VT52 Terminal",
+		"X68000":         "Sharp X68000",
+		"ZX-Spectrum":    "Sinclair ZX Spectrum",
+		"Spectrum":       "Sinclair ZX Spectrum",     // Common reference
+		"zx48":           "Sinclair ZX Spectrum 48K", // Specific variant
+		"ZX81":           "Sinclair ZX80 / ZX81",
+		"ZXNext":         "ZX Spectrum Next",
+
+		// Special/Utility Systems
+		"Arcade":  "Arcade", // Keep as-is for arcade games
+		"mame":    "MAME Arcade",
+		"hbmame":  "HBMAME (Homebrew MAME)",
+		"MEMTEST": "Memory Test Utility",
+	}
+
+	// Return mapped name if available, otherwise return original ID
+	if displayName, exists := displayNameMap[systemID]; exists {
+		return displayName
+	}
+
+	// Fallback: return the original system ID
+	return systemID
 }
